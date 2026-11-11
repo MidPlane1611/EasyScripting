@@ -1,6 +1,6 @@
 --[[
-    Easy Scripting v0.6
-    A compact Luau project workspace for personal projects and experiences
+    Easy Scripting v0.9
+    A Luau project workspace for personal projects and experiences
     you own or are explicitly allowed to test.
 
     Features
@@ -97,10 +97,10 @@ end
 -- cannot invoke the same action twice.
 local function bindButton(object, callback)
     if not object or type(callback) ~= "function" then return end
-    local lastActivation = 0
+    local lastActivation = -math.huge
     local function invoke()
         local now = os.clock()
-        if now - lastActivation < 0.18 then return end
+        if now - lastActivation < 0.28 then return end
         lastActivation = now
         local ok, err = pcall(callback)
         if not ok then
@@ -246,7 +246,7 @@ local header = new("Frame", {
     BackgroundColor3 = C.panel,
     BorderSizePixel = 0,
 }, main)
-label(header, "  Easy Scripting", UDim2.new(1, -150, 1, 0), UDim2.fromOffset(7, 0), 15, C.text, Enum.Font.GothamBold)
+label(header, "  Easy Scripting  v0.9", UDim2.new(1, -150, 1, 0), UDim2.fromOffset(7, 0), 15, C.text, Enum.Font.GothamBold)
 local headerContext = label(header, "HOME", UDim2.fromOffset(105, 20), UDim2.new(1, -145, 0, 11), 9, C.muted)
 headerContext.TextXAlignment = Enum.TextXAlignment.Right
 local closeMain = button(header, "×", UDim2.fromOffset(30, 28), UDim2.new(1, -36, 0, 7), function()
@@ -982,6 +982,8 @@ local projectsTab = button(projectsPage, "Projects", UDim2.fromOffset(112, 32), 
 local executeTab = button(projectsPage, "Execute", UDim2.fromOffset(112, 32), UDim2.new(1, -124, 0, 8), nil)
 
 label(projectsPage, "Saved projects", UDim2.new(1, -24, 0, 22), UDim2.fromOffset(14, 47), 12, C.muted, Enum.Font.GothamMedium)
+local projectCountLabel = label(projectsPage, "0 projects", UDim2.new(0, 110, 0, 22), UDim2.new(1, -122, 0, 47), 10, C.muted, Enum.Font.Gotham)
+projectCountLabel.TextXAlignment = Enum.TextXAlignment.Right
 local projectList = new("ScrollingFrame", {
     Position = UDim2.fromOffset(12, 73),
     Size = UDim2.new(1, -24, 1, -130),
@@ -1247,121 +1249,129 @@ local function renderTree()
     fileTree.CanvasSize = UDim2.fromOffset(0, fileTreeLayout.AbsoluteContentSize.Y + 5)
 end
 
-local function showInputDialog(title, placeholder, confirmText, callback)
+local function showInputDialog(title, placeholder, confirmText, callback, initialText)
     local overlay = new("Frame", {
+        Name = "ProjectInputOverlay",
         Size = UDim2.fromScale(1, 1),
         BackgroundColor3 = Color3.new(0, 0, 0),
-        BackgroundTransparency = 0.4,
+        BackgroundTransparency = 0.35,
         BorderSizePixel = 0,
+        Active = true,
         ZIndex = 80,
     }, main)
-    local dialogWidth = math.min(330, width - 30)
+
+    local dialogWidth = math.min(390, width - 28)
     local dialog = new("Frame", {
-        Size = UDim2.fromOffset(dialogWidth, 150),
-        Position = UDim2.new(0.5, -dialogWidth / 2, 0.5, -75),
+        Name = "ProjectInputDialog",
+        Size = UDim2.fromOffset(dialogWidth, 184),
+        Position = UDim2.new(0.5, -dialogWidth / 2, 0.5, -92),
         BackgroundColor3 = C.panel,
         BorderSizePixel = 0,
+        Active = true,
         ZIndex = 81,
     }, overlay)
-    corner(dialog, 9)
+    corner(dialog, 10)
     stroke(dialog)
-    label(dialog, title, UDim2.new(1, -20, 0, 26), UDim2.fromOffset(10, 8), 13, C.text, Enum.Font.GothamBold).ZIndex = 82
+
+    label(dialog, title, UDim2.new(1, -24, 0, 28), UDim2.fromOffset(12, 9), 14, C.text, Enum.Font.GothamBold).ZIndex = 82
+    label(dialog, "Project or item name", UDim2.new(1, -24, 0, 18), UDim2.fromOffset(12, 43), 10, C.muted).ZIndex = 82
+
     local input = new("TextBox", {
-        Size = UDim2.new(1, -20, 0, 34),
-        Position = UDim2.fromOffset(10, 40),
+        Name = "DialogInput",
+        Size = UDim2.new(1, -24, 0, 38),
+        Position = UDim2.fromOffset(12, 65),
         BackgroundColor3 = C.panel2,
         BorderSizePixel = 0,
-        Text = "",
-        PlaceholderText = placeholder,
+        Text = initialText or "",
+        PlaceholderText = placeholder or "Enter a name",
         PlaceholderColor3 = C.muted,
         TextColor3 = C.text,
-        TextSize = 12,
+        TextSize = 13,
         Font = Enum.Font.Gotham,
         ClearTextOnFocus = false,
-        ZIndex = 82,
+        TextEditable = true,
+        Active = true,
+        Selectable = true,
+        ZIndex = 83,
     }, dialog)
-    corner(input, 6)
-    local cancel = button(dialog, "Cancel", UDim2.fromOffset(76, 29), UDim2.new(1, -164, 1, -38), function() overlay:Destroy() end)
-    cancel.ZIndex = 82
-    local confirm = button(dialog, confirmText or "Create", UDim2.fromOffset(78, 29), UDim2.new(1, -86, 1, -38), function()
+    corner(input, 7)
+
+    local errorLabel = label(dialog, "", UDim2.new(1, -24, 0, 18), UDim2.fromOffset(12, 105), 9, C.red)
+    errorLabel.TextWrapped = true
+    errorLabel.ZIndex = 83
+
+    local function closeDialog()
+        if overlay and overlay.Parent then overlay:Destroy() end
+    end
+
+    local function submit()
+        if not input or not input.Parent then return end
         local value = trim(input.Text)
         if value == "" then
-            input.PlaceholderText = "A name is required"
+            errorLabel.Text = "Enter a name before creating the project."
+            input:CaptureFocus()
             return
         end
-        local ok, message = callback(value)
-        if ok then
-            overlay:Destroy()
-        else
-            input.Text = value
-            input.PlaceholderText = message or "Invalid name"
+
+        local callOk, accepted, message = pcall(callback, value)
+        if not callOk then
+            errorLabel.Text = "Action failed: " .. tostring(accepted)
+            warn("[Easy Scripting] Dialog callback failed: " .. tostring(accepted))
+            return
         end
-    end, C.accent)
-    confirm.ZIndex = 82
-    input:CaptureFocus()
+        if accepted then
+            closeDialog()
+        else
+            errorLabel.Text = tostring(message or "This name is not valid.")
+            input:CaptureFocus()
+        end
+    end
+
+    local cancel = button(dialog, "Cancel", UDim2.fromOffset(86, 32), UDim2.new(1, -190, 1, -42), closeDialog)
+    cancel.ZIndex = 84
+    local confirm = button(dialog, confirmText or "Create", UDim2.fromOffset(92, 32), UDim2.new(1, -104, 1, -42), submit, C.accent)
+    confirm.ZIndex = 84
+
+    input.FocusLost:Connect(function(enterPressed)
+        if enterPressed then submit() end
+    end)
+
+    -- Defer focus until after the popup has been parented and laid out.
+    task.defer(function()
+        if input and input.Parent then
+            pcall(function() input:CaptureFocus() end)
+        end
+    end)
 end
 
 local function createProjectCard(project, order)
     ensureProject(project)
 
-    -- Keep project actions in a dedicated, always-visible row.
-    -- The older layout placed narrow buttons at the extreme right edge;
-    -- this layout is more reliable on touch screens and scaled executor GUIs.
     local card = new("Frame", {
         Name = "ProjectCard_" .. tostring(project.id),
-        Size = UDim2.new(1, -6, 0, 94),
+        Size = UDim2.new(1, -6, 0, 110),
         BackgroundColor3 = C.panel,
         BorderSizePixel = 0,
         LayoutOrder = order,
         ClipsDescendants = false,
+        ZIndex = 2,
     }, projectList)
-    corner(card, 8)
-    stroke(card, C.border, 0.45)
+    corner(card, 9)
+    stroke(card, C.border, 0.35)
 
-    local nameLabel = label(
-        card,
-        project.name,
-        UDim2.new(1, -20, 0, 23),
-        UDim2.fromOffset(10, 7),
-        12,
-        C.text,
-        Enum.Font.GothamBold
-    )
-    nameLabel.ZIndex = 2
+    local nameLabel = label(card, project.name,
+        UDim2.new(1, -20, 0, 24), UDim2.fromOffset(11, 7), 13, C.text, Enum.Font.GothamBold)
+    nameLabel.ZIndex = 5
 
-    local detailsLabel = label(
-        card,
+    local detailsLabel = label(card,
         "Luau  ·  " .. projectBytes(project) .. "  ·  " .. tostring(#project.files) .. " files",
-        UDim2.new(1, -20, 0, 17),
-        UDim2.fromOffset(10, 30),
-        9,
-        C.muted
-    )
-    detailsLabel.ZIndex = 2
+        UDim2.new(1, -20, 0, 18), UDim2.fromOffset(11, 32), 10, C.muted)
+    detailsLabel.ZIndex = 5
 
-    local actionBar = new("Frame", {
-        Name = "ProjectActions",
-        Position = UDim2.new(0, 9, 1, -36),
-        Size = UDim2.new(1, -18, 0, 28),
-        BackgroundTransparency = 1,
-        BorderSizePixel = 0,
-        ZIndex = 5,
-    }, card)
-
-    local actionLayout = new("UIListLayout", {
-        FillDirection = Enum.FillDirection.Horizontal,
-        HorizontalAlignment = Enum.HorizontalAlignment.Left,
-        VerticalAlignment = Enum.VerticalAlignment.Center,
-        SortOrder = Enum.SortOrder.LayoutOrder,
-        Padding = UDim.new(0, 6),
-    }, actionBar)
-
-    local openButton = button(
-        actionBar,
-        "Open Project",
-        UDim2.fromOffset(104, 27),
-        UDim2.fromOffset(0, 0),
-        function()
+    -- Put buttons directly under the card, not inside a nested layout.
+    -- Fixed positions are reliable in touch and executor-created ScreenGuis.
+    local openButton = button(card, "Open Project",
+        UDim2.fromOffset(96, 32), UDim2.fromOffset(10, 66), function()
             ensureProject(project)
             currentProject = project
             selectedFilePath = project.activeFile
@@ -1372,46 +1382,38 @@ local function createProjectCard(project, order)
             projectsPage.Visible = false
             executePage.Visible = false
             editorPage.Visible = true
-            editorStatus.Text = "Project opened"
+            editorStatus.Text = "Project opened: " .. project.name
             setTextColor(editorStatus, C.green)
             consoleEntries = {}
             log("Info", "Opened project " .. project.name)
             renderTree()
-        end,
-        C.accent
-    )
-    openButton.LayoutOrder = 1
-    openButton.ZIndex = 6
+        end, C.accent)
+    openButton.Position = UDim2.fromOffset(10, 66)
+    openButton.ZIndex = 10
     openButton.TextSize = 10
+    openButton.Active = true
+    openButton.Selectable = true
 
-    local renameButton = button(
-        actionBar,
-        "Rename",
-        UDim2.fromOffset(76, 27),
-        UDim2.fromOffset(0, 0),
-        function()
-            showInputDialog("Rename project", project.name, "Rename", function(value)
+    local renameButton = button(card, "Rename",
+        UDim2.fromOffset(68, 32), UDim2.fromOffset(112, 66), function()
+            showInputDialog("Rename project", "Enter a new project name", "Rename", function(value)
                 local oldName = project.name
                 project.name = value
                 project.updated = os.time()
-                local ok, message = saveProjects()
+                saveProjects()
                 refreshProjects()
-                log(ok and "Success" or "Warning", ok and ("Renamed " .. oldName .. " to " .. value) or message)
+                log("Success", "Renamed " .. oldName .. " to " .. value)
                 return true
-            end)
-        end,
-        C.panel2
-    )
-    renameButton.LayoutOrder = 2
-    renameButton.ZIndex = 6
+            end, project.name)
+        end, C.panel2)
+    renameButton.Position = UDim2.fromOffset(112, 66)
+    renameButton.ZIndex = 10
     renameButton.TextSize = 10
+    renameButton.Active = true
+    renameButton.Selectable = true
 
-    local deleteButton = button(
-        actionBar,
-        "Delete",
-        UDim2.fromOffset(68, 27),
-        UDim2.fromOffset(0, 0),
-        function()
+    local deleteButton = button(card, "Delete",
+        UDim2.fromOffset(64, 32), UDim2.fromOffset(188, 66), function()
             local removedName = project.name
             for index, item in ipairs(projects) do
                 if item.id == project.id then
@@ -1419,23 +1421,29 @@ local function createProjectCard(project, order)
                     break
                 end
             end
-            local ok, message = saveProjects()
+            if currentProject and currentProject.id == project.id then
+                currentProject = nil
+            end
+            saveProjects()
             refreshProjects()
-            log(ok and "Success" or "Warning", ok and ("Deleted project " .. removedName) or message)
-        end,
-        Color3.fromRGB(91, 43, 52)
-    )
-    deleteButton.LayoutOrder = 3
-    deleteButton.ZIndex = 6
+            log("Success", "Deleted project " .. removedName)
+        end, Color3.fromRGB(91, 43, 52))
+    deleteButton.Position = UDim2.fromOffset(188, 66)
+    deleteButton.ZIndex = 10
     deleteButton.TextSize = 10
+    deleteButton.Active = true
+    deleteButton.Selectable = true
 
-    -- Expose the controls in the card for easy visual/debug inspection.
+    card:SetAttribute("ProjectId", tostring(project.id))
     card:SetAttribute("HasOpenButton", true)
     card:SetAttribute("HasRenameButton", true)
     card:SetAttribute("HasDeleteButton", true)
 end
 
 refreshProjects = function()
+    if projectCountLabel then
+        projectCountLabel.Text = tostring(#projects) .. (#projects == 1 and " project" or " projects")
+    end
     for _, child in ipairs(projectList:GetChildren()) do
         if child:IsA("GuiObject") and not child:IsA("UIListLayout") then child:Destroy() end
     end
@@ -1451,21 +1459,33 @@ refreshProjects = function()
     end
 end
 
-local addProject = button(projectsPage, "+ Add Project", UDim2.new(1, -24, 0, 37), UDim2.new(0, 12, 1, -47), function()
-    showInputDialog("Create project", "My project", "Create", function(value)
-        table.insert(projects, {
+local addProject = button(projectsPage, "+ Add Project", UDim2.new(1, -24, 0, 42), UDim2.new(0, 12, 1, -52), function()
+    showInputDialog("Create project", "Enter a project name", "Create", function(value)
+        for _, existing in ipairs(projects) do
+            if trim(existing.name):lower() == value:lower() then
+                return false, "A project with that name already exists."
+            end
+        end
+
+        local newProject = {
             id = tostring(os.time()) .. "_" .. tostring(math.random(1000, 9999)),
             name = value,
             files = {{path = "main.lua", code = "-- " .. value .. "\n\n", autoExecute = false}},
             folders = {},
             activeFile = "main.lua",
             updated = os.time(),
-        })
-        local ok, message = saveProjects()
+        }
+
+        table.insert(projects, newProject)
         refreshProjects()
-        log(ok and "Success" or "Warning", ok and ("Created project " .. value) or message)
+        local saved, saveMessage = saveProjects()
+        if saved then
+            log("Success", "Created project " .. value .. " and saved it.")
+        else
+            log("Warning", "Created project " .. value .. " for this session. " .. tostring(saveMessage))
+        end
         return true
-    end)
+    end, "My project")
 end, C.accent)
 
 bindButton(addFileButton, function()
@@ -1753,4 +1773,4 @@ screenGui.Destroying:Connect(function()
     disconnectRemoteListeners()
 end)
 
-print("Easy Scripting v0.6 loaded. Click handlers use Activated + MouseButton1Click fallback.")
+print("Easy Scripting v0.9 loaded. Project actions are direct card children.")
