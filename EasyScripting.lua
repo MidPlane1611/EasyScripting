@@ -1,5 +1,5 @@
 --[[
-    Easy Scripting v0.5
+    Easy Scripting v0.6
     A compact Luau project workspace for personal projects and experiences
     you own or are explicitly allowed to test.
 
@@ -92,6 +92,25 @@ local function label(parent, text, size, position, textSize, color, font)
     }, parent)
 end
 
+-- Some executor UI containers do not consistently forward GuiButton.Activated.
+-- Bind both Activated and MouseButton1Click, with a small debounce so one tap
+-- cannot invoke the same action twice.
+local function bindButton(object, callback)
+    if not object or type(callback) ~= "function" then return end
+    local lastActivation = 0
+    local function invoke()
+        local now = os.clock()
+        if now - lastActivation < 0.18 then return end
+        lastActivation = now
+        local ok, err = pcall(callback)
+        if not ok then
+            warn("[Easy Scripting] Button action failed: " .. tostring(err))
+        end
+    end
+    pcall(function() object.Activated:Connect(invoke) end)
+    pcall(function() object.MouseButton1Click:Connect(invoke) end)
+end
+
 local function button(parent, text, size, position, callback, background)
     local object = new("TextButton", {
         Size = size,
@@ -103,13 +122,11 @@ local function button(parent, text, size, position, callback, background)
         TextSize = 12,
         Font = Enum.Font.GothamMedium,
         AutoButtonColor = true,
+        Active = true,
+        Selectable = true,
     }, parent)
     corner(object, 7)
-    object.Activated:Connect(function()
-        if callback then
-            callback()
-        end
-    end)
+    bindButton(object, callback)
     return object
 end
 
@@ -204,12 +221,14 @@ local screenGui = new("ScreenGui", {
 local touch = UserInputService.TouchEnabled
 local camera = workspace.CurrentCamera
 local viewport = camera and camera.ViewportSize or Vector2.new(1280, 720)
-local minWidth = touch and 300 or 370
-local maxWidth = touch and 440 or 620
-local width = math.clamp(viewport.X - (touch and 18 or 40), minWidth, maxWidth)
-local minHeight = touch and 300 or 350
-local maxHeight = touch and 460 or 500
-local height = math.clamp(viewport.Y - (touch and 90 or 80), minHeight, maxHeight)
+-- Roomier dimensions: the earlier compact pass left too little editor space.
+-- On phones the panel uses most of the available viewport without extending off-screen.
+local minWidth = touch and math.min(320, math.max(260, viewport.X - 12)) or 520
+local maxWidth = touch and math.max(minWidth, viewport.X - 12) or 700
+local width = math.clamp(viewport.X - (touch and 12 or 48), minWidth, maxWidth)
+local minHeight = touch and math.min(430, math.max(300, viewport.Y - 36)) or 440
+local maxHeight = touch and math.max(minHeight, math.min(680, viewport.Y - 36)) or 560
+local height = math.clamp(viewport.Y - (touch and 72 or 100), minHeight, maxHeight)
 
 local main = new("Frame", {
     Name = "MainWindow",
@@ -439,7 +458,7 @@ local function renderConsole()
         if entry.line then
             local lineLabel = label(row, "Click to go to line " .. tostring(entry.line), UDim2.new(1, -16, 0, 14), UDim2.fromOffset(8, 39), 9, C.accent)
             if entry.line then
-                row.Activated:Connect(function() jumpToLine(entry.line) end)
+                bindButton(row, function() jumpToLine(entry.line) end)
             end
         end
     end
@@ -636,7 +655,7 @@ local function openDex()
         end
         addNode(testFolder, 0)
     end
-    refresh.Activated:Connect(function() drawTree() end)
+    bindButton(refresh, drawTree)
     drawTree()
 end
 
@@ -1368,7 +1387,7 @@ local addProject = button(projectsPage, "+ Add Project", UDim2.new(1, -24, 0, 37
     end)
 end, C.accent)
 
-addFileButton.Activated:Connect(function()
+bindButton(addFileButton, function()
     if not currentProject then return end
     showInputDialog("Add file", "folder/example.lua or main.lua", "Add", function(value)
         local path = normalizePath(value)
@@ -1387,7 +1406,7 @@ addFileButton.Activated:Connect(function()
     end)
 end)
 
-addFolderButton.Activated:Connect(function()
+bindButton(addFolderButton, function()
     if not currentProject then return end
     showInputDialog("Add folder", "folder or folder/subfolder", "Add", function(value)
         local path = normalizePath(value)
@@ -1403,7 +1422,7 @@ addFolderButton.Activated:Connect(function()
     end)
 end)
 
-deleteFileButton.Activated:Connect(function()
+bindButton(deleteFileButton, function()
     if not currentProject then return end
     if #currentProject.files <= 1 then
         log("Warning", "A project must contain at least one file.")
@@ -1588,7 +1607,7 @@ local function insertNewline()
     editorBox:CaptureFocus()
 end
 
-newlineButton.Activated:Connect(insertNewline)
+bindButton(newlineButton, insertNewline)
 if touch then
     local function refocusEditor()
         task.defer(function()
@@ -1621,8 +1640,8 @@ local function showExecute()
 end
 
 -- Reconnect top-level home tabs with the named navigation functions.
-projectsTab.Activated:Connect(showProjects)
-executeTab.Activated:Connect(showExecute)
+bindButton(projectsTab, showProjects)
+bindButton(executeTab, showExecute)
 
 loadProjects()
 refreshProjects()
@@ -1653,4 +1672,4 @@ screenGui.Destroying:Connect(function()
     disconnectRemoteListeners()
 end)
 
-print("Easy Scripting v0.5 loaded.")
+print("Easy Scripting v0.6 loaded. Click handlers use Activated + MouseButton1Click fallback.")
