@@ -1,5 +1,5 @@
 --[[
-    Easy Scripting v1.3
+    Easy Scripting v1.4
     Built from the user's original, working v0.1 source.
 
     Main features:
@@ -18,10 +18,10 @@
       * Executor file persistence when readfile/writefile are available
 
     SAFETY / SCOPE:
-      * Dex displays the client-visible game hierarchy, with a read-only Properties panel.
+      * Dex displays the client-visible game hierarchy, with a read-only Properties panel and Explorer-style class/name sorting.
       * Script source viewing obeys Roblox client source-access restrictions; RegisterSource
         is available for source text supplied by your own authorized development setup.
-      * RemoteSpy records calls explicitly routed through its API for your own test projects.
+      * RemoteSpy records instrumented outgoing calls and incoming RemoteEvents in the dedicated test folder.
       * FreeCam moves only the camera; it never moves the character's root part.
 ]]
 
@@ -30,6 +30,7 @@ local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local TextService = game:GetService("TextService")
 local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -40,7 +41,7 @@ end
 local ROOT_FOLDER = "EasyScripting"
 local DATA_FILE = ROOT_FOLDER .. "/projects.json"
 local GUI_NAME = "EasyScriptingGui"
-local VERSION = "v1.3"
+local VERSION = "v1.4"
 
 local COLORS = {
     Background = Color3.fromRGB(18, 20, 27),
@@ -1448,10 +1449,16 @@ local function keepEditorCaretVisible()
         lastBreak = found
         searchFrom = found + 1
     end
-    local column = #beforeCaret - lastBreak + 1
-    local charWidth = math.max(1, editorBox.TextSize * 0.60)
-    local lineHeight = math.max(1, editorBox.TextSize * 1.25)
-    local caretX = 8 + (column - 1) * charWidth
+    local linePrefix = string.sub(beforeCaret, lastBreak + 1)
+    local prefixBounds = TextService:GetTextSize(
+        linePrefix ~= "" and linePrefix or " ",
+        editorBox.TextSize,
+        editorBox.Font,
+        Vector2.new(100000, 100000)
+    )
+    local lineBounds = TextService:GetTextSize("Ag", editorBox.TextSize, editorBox.Font, Vector2.new(100000, 100000))
+    local lineHeight = math.max(1, lineBounds.Y)
+    local caretX = 8 + (linePrefix == "" and 0 or prefixBounds.X)
     local caretY = 6 + (lineNumber - 1) * lineHeight
     local view = editorViewport.AbsoluteSize
     local current = editorViewport.CanvasPosition
@@ -1474,12 +1481,29 @@ local function keepEditorCaretVisible()
 end
 
 editorBox:GetPropertyChangedSignal("Text"):Connect(function()
+    -- Keep the active buffer up to date immediately, even before the user presses Save.
+    if currentProject then
+        syncEditorToFile(currentProject, editorBox.Text)
+    end
     measureEditorCanvas()
     task.defer(keepEditorCaretVisible)
 end)
-editorBox:GetPropertyChangedSignal("CursorPosition"):Connect(function()
-    task.defer(keepEditorCaretVisible)
+
+-- Do not auto-scroll on mouse focus: Roblox may briefly report a temporary caret
+-- position when a TextBox first receives focus. Follow caret movement from keys instead.
+UserInputService.InputBegan:Connect(function(input)
+    if not editorBox or not editorBox:IsFocused() then
+        return
+    end
+    local key = input.KeyCode
+    if key == Enum.KeyCode.Left or key == Enum.KeyCode.Right
+        or key == Enum.KeyCode.Up or key == Enum.KeyCode.Down
+        or key == Enum.KeyCode.Home or key == Enum.KeyCode.End
+        or key == Enum.KeyCode.PageUp or key == Enum.KeyCode.PageDown then
+        task.defer(keepEditorCaretVisible)
+    end
 end)
+
 editorViewport:GetPropertyChangedSignal("AbsoluteSize"):Connect(function()
     measureEditorCanvas()
 end)
@@ -2020,18 +2044,82 @@ if sharedEnvironment then
     end)
 end
 
+-- Approximation of Roblox ReflectionMetadataClass.ExplorerOrder for common classes.
+-- Original Dex sorts by ExplorerOrder first, then by Instance name, then ClassName.
+-- Classes absent from this table use the metadata default and fall back to name sorting.
+local DEX_CLASS_ORDER = {
+    TerrainRegion = 0,
+    Clothing = 0,
+    BackpackItem = 0,
+    Sound = 1,
+    Team = 1,
+    Hat = 3,
+    Smoke = 3,
+    Sparkles = 3,
+    Explosion = 3,
+    ForceField = 3,
+    SpawnLocation = 3,
+    NetworkClient = 3,
+    NetworkServer = 3,
+    NetworkReplicator = 3,
+    Script = 3,
+    Tool = 3,
+    PointLight = 3,
+    SpotLight = 3,
+    BoolValue = 3,
+    IntValue = 3,
+    NumberValue = 3,
+    StringValue = 3,
+    ObjectValue = 3,
+    Vector3Value = 3,
+    CFrameValue = 3,
+    Color3Value = 3,
+    BrickColorValue = 3,
+    BindableFunction = 4,
+    RemoteFunction = 4,
+    LocalScript = 4,
+    BindableEvent = 5,
+    RemoteEvent = 5,
+    ModuleScript = 5,
+    Model = 10,
+    Part = 11,
+    TrussPart = 12,
+    WedgePart = 12,
+    CornerWedgePart = 12,
+    PlayerGui = 13,
+    ScreenGui = 14,
+    BillboardGui = 14,
+    SurfaceGui = 14,
+    JointInstance = 20,
+    Weld = 20,
+    HttpService = 101,
+}
+
+local function getDexClassOrder(object)
+    local order = DEX_CLASS_ORDER[object.ClassName]
+    if order ~= nil then
+        return order
+    end
+    return 2147483647
+end
+
 local function safeChildren(object)
     local ok, children = pcall(function()
         return object:GetChildren()
     end)
     if ok and type(children) == "table" then
         table.sort(children, function(a, b)
-            local aName = tostring(a.Name):lower()
-            local bName = tostring(b.Name):lower()
-            if aName == bName then
-                return a.ClassName < b.ClassName
+            local aOrder = getDexClassOrder(a)
+            local bOrder = getDexClassOrder(b)
+            if aOrder ~= bOrder then
+                return aOrder < bOrder
             end
-            return aName < bName
+            local aName = tostring(a.Name)
+            local bName = tostring(b.Name)
+            if aName ~= bName then
+                return aName < bName
+            end
+            return a.ClassName < b.ClassName
         end)
         return children
     end
@@ -2739,9 +2827,61 @@ local function openRemoteSpy()
     local searchBox
     local renderLeft
     local renderRight
+    local automaticIncomingConnections = {}
+    local automaticFolderConnection = nil
+    local automaticallyWatched = setmetatable({}, {__mode = "k"})
+
+    local function stopAutomaticIncomingWatch()
+        for _, connection in ipairs(automaticIncomingConnections) do
+            pcall(function() connection:Disconnect() end)
+        end
+        automaticIncomingConnections = {}
+        automaticallyWatched = setmetatable({}, {__mode = "k"})
+        if automaticFolderConnection then
+            pcall(function() automaticFolderConnection:Disconnect() end)
+            automaticFolderConnection = nil
+        end
+    end
+
+    local function watchOwnTestRemoteFolder()
+        stopAutomaticIncomingWatch()
+        local root = ReplicatedStorage:FindFirstChild("EasyScriptingRemotes")
+        if not root then
+            return 0, false
+        end
+
+        local watchedCount = 0
+        local function attach(remote)
+            if not remote:IsA("RemoteEvent") or automaticallyWatched[remote] then
+                return
+            end
+            automaticallyWatched[remote] = true
+            local connection = remote.OnClientEvent:Connect(function(...)
+                if remoteSpyState.recording then
+                    recordRemoteCall(
+                        "Incoming",
+                        remote,
+                        "OnClientEvent",
+                        packArguments(...),
+                        nil,
+                        "Server -> client (test folder)"
+                    )
+                end
+            end)
+            table.insert(automaticIncomingConnections, connection)
+            watchedCount = watchedCount + 1
+        end
+
+        for _, descendant in ipairs(root:GetDescendants()) do
+            attach(descendant)
+        end
+        automaticFolderConnection = root.DescendantAdded:Connect(attach)
+        return watchedCount, true
+    end
 
     frame, content = makeToolWindow("RemoteSpyWindow", "RemoteSpy", width, height, function()
         remoteSpyState.recording = false
+        stopAutomaticIncomingWatch()
         if statusLabel then statusLabel.Text = "Stopped" end
         if startButton then startButton.Text = "Start" end
         frame.Visible = false
@@ -2762,12 +2902,24 @@ local function openRemoteSpy()
     local clearRight = apiRight + apiWidth + 4
     local startRight = clearRight + clearWidth + 4
     local toolbarRightWidth = startRight + startWidth
-    statusLabel = createLabel(toolbar, "Stopped", UDim2.new(1, -(toolbarRightWidth + 8), 1, 0), UDim2.fromOffset(0, 0), 9, COLORS.Muted)
+    statusLabel = createLabel(toolbar, "Stopped | test remotes only", UDim2.new(1, -(toolbarRightWidth + 8), 1, 0), UDim2.fromOffset(0, 0), 9, COLORS.Muted)
     statusLabel.ZIndex = 54
     startButton = createButton(toolbar, "Start", UDim2.fromOffset(startWidth, 30), UDim2.new(1, -toolbarRightWidth, 0, 0), function()
-        remoteSpyState.recording = not remoteSpyState.recording
-        startButton.Text = remoteSpyState.recording and "Stop" or "Start"
-        statusLabel.Text = remoteSpyState.recording and "Recording instrumented calls" or "Stopped"
+        if remoteSpyState.recording then
+            remoteSpyState.recording = false
+            stopAutomaticIncomingWatch()
+            startButton.Text = "Start"
+            statusLabel.Text = "Stopped"
+        else
+            remoteSpyState.recording = true
+            local watchedCount, folderFound = watchOwnTestRemoteFolder()
+            startButton.Text = "Stop"
+            if folderFound then
+                statusLabel.Text = "Recording | watching " .. tostring(watchedCount) .. " test RemoteEvent(s)"
+            else
+                statusLabel.Text = "Recording wrappers | test folder not found"
+            end
+        end
     end, COLORS.Green)
     startButton.ZIndex = 54
     clearButton = createButton(toolbar, "Clear", UDim2.fromOffset(clearWidth, 30), UDim2.new(1, -clearRight - clearWidth, 0, 0), function()
@@ -2779,7 +2931,7 @@ local function openRemoteSpy()
     end, COLORS.Panel2)
     clearButton.ZIndex = 54
     local helpButton = createButton(toolbar, "API", UDim2.fromOffset(apiWidth, 30), UDim2.new(1, -apiRight - apiWidth, 0, 0), function()
-        logConsole("Info", "RemoteSpy API: getgenv().EasyScriptingRemoteSpy.FireServer(remote, ...), InvokeServer(remote, ...), ObserveIncoming(remote), ConnectIncoming(remote, callback), BindClientInvoke(remote, callback). Use only in your own/authorized test scripts.")
+        logConsole("Info", "RemoteSpy test workflow: place your own test RemoteEvents under ReplicatedStorage.EasyScriptingRemotes, press Start to observe incoming events, and route outgoing calls through getgenv().EasyScriptingRemoteSpy.FireServer(remote, ...) or InvokeServer(remote, ...). For incoming callbacks use ConnectIncoming(remote, callback). This does not intercept ordinary calls in unrelated scripts or other experiences.")
     end, COLORS.Panel2)
     helpButton.ZIndex = 54
     local searchWrap = make("Frame", {
@@ -2994,7 +3146,7 @@ local function openRemoteSpy()
             end)
         end
         if #visibleGroups == 0 then
-            local empty = createLabel(leftList, "No recorded calls.\n\nFor outgoing calls, use the API wrappers in your own test code. For incoming events, register with ObserveIncoming or ConnectIncoming.", UDim2.new(1, -14, 0, 112), UDim2.fromOffset(7, 8), 9, COLORS.Muted)
+            local empty = createLabel(leftList, "No recorded calls.\n\nIncoming: add your own RemoteEvents to ReplicatedStorage.EasyScriptingRemotes and press Start.\nOutgoing: use the EasyScriptingRemoteSpy API wrapper in your own test code.", UDim2.new(1, -14, 0, 112), UDim2.fromOffset(7, 8), 9, COLORS.Muted)
             empty.TextWrapped = true
             empty.TextYAlignment = Enum.TextYAlignment.Top
             empty.LayoutOrder = 1
