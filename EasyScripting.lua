@@ -1302,56 +1302,137 @@ local function showInputDialog(title, placeholder, confirmText, callback)
 end
 
 local function createProjectCard(project, order)
+    ensureProject(project)
+
+    -- Keep project actions in a dedicated, always-visible row.
+    -- The older layout placed narrow buttons at the extreme right edge;
+    -- this layout is more reliable on touch screens and scaled executor GUIs.
     local card = new("Frame", {
-        Size = UDim2.new(1, -6, 0, 72),
+        Name = "ProjectCard_" .. tostring(project.id),
+        Size = UDim2.new(1, -6, 0, 94),
         BackgroundColor3 = C.panel,
         BorderSizePixel = 0,
         LayoutOrder = order,
+        ClipsDescendants = false,
     }, projectList)
     corner(card, 8)
-    stroke(card, C.border, 0.55)
-    label(card, project.name, UDim2.new(1, -170, 0, 24), UDim2.fromOffset(10, 8), 12, C.text, Enum.Font.GothamBold)
-    label(card, "Luau · " .. projectBytes(project) .. " · " .. tostring(#project.files) .. " files", UDim2.new(1, -170, 0, 18), UDim2.fromOffset(10, 36), 9, C.muted)
+    stroke(card, C.border, 0.45)
 
-    button(card, "Open", UDim2.fromOffset(49, 27), UDim2.new(1, -158, 0.5, -13), function()
-        ensureProject(project)
-        currentProject = project
-        selectedFilePath = project.activeFile
-        local file = getFile(project, selectedFilePath)
-        editorBox.Text = file and file.code or ""
-        activeFileLabel.Text = selectedFilePath or "main.lua"
-        headerContext.Text = project.name
-        projectsPage.Visible = false
-        executePage.Visible = false
-        editorPage.Visible = true
-        editorStatus.Text = "Project opened"
-        setTextColor(editorStatus, C.green)
-        consoleEntries = {}
-        log("Info", "Opened project " .. project.name)
-        renderTree()
-    end, C.accent)
+    local nameLabel = label(
+        card,
+        project.name,
+        UDim2.new(1, -20, 0, 23),
+        UDim2.fromOffset(10, 7),
+        12,
+        C.text,
+        Enum.Font.GothamBold
+    )
+    nameLabel.ZIndex = 2
 
-    button(card, "Rename", UDim2.fromOffset(54, 27), UDim2.new(1, -103, 0.5, -13), function()
-        showInputDialog("Rename project", project.name, "Rename", function(value)
-            local oldName = project.name
-            project.name = value
-            project.updated = os.time()
+    local detailsLabel = label(
+        card,
+        "Luau  ·  " .. projectBytes(project) .. "  ·  " .. tostring(#project.files) .. " files",
+        UDim2.new(1, -20, 0, 17),
+        UDim2.fromOffset(10, 30),
+        9,
+        C.muted
+    )
+    detailsLabel.ZIndex = 2
+
+    local actionBar = new("Frame", {
+        Name = "ProjectActions",
+        Position = UDim2.new(0, 9, 1, -36),
+        Size = UDim2.new(1, -18, 0, 28),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, card)
+
+    local actionLayout = new("UIListLayout", {
+        FillDirection = Enum.FillDirection.Horizontal,
+        HorizontalAlignment = Enum.HorizontalAlignment.Left,
+        VerticalAlignment = Enum.VerticalAlignment.Center,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+        Padding = UDim.new(0, 6),
+    }, actionBar)
+
+    local openButton = button(
+        actionBar,
+        "Open Project",
+        UDim2.fromOffset(104, 27),
+        UDim2.fromOffset(0, 0),
+        function()
+            ensureProject(project)
+            currentProject = project
+            selectedFilePath = project.activeFile
+            local file = getFile(project, selectedFilePath)
+            editorBox.Text = file and file.code or ""
+            activeFileLabel.Text = selectedFilePath or "main.lua"
+            headerContext.Text = project.name
+            projectsPage.Visible = false
+            executePage.Visible = false
+            editorPage.Visible = true
+            editorStatus.Text = "Project opened"
+            setTextColor(editorStatus, C.green)
+            consoleEntries = {}
+            log("Info", "Opened project " .. project.name)
+            renderTree()
+        end,
+        C.accent
+    )
+    openButton.LayoutOrder = 1
+    openButton.ZIndex = 6
+    openButton.TextSize = 10
+
+    local renameButton = button(
+        actionBar,
+        "Rename",
+        UDim2.fromOffset(76, 27),
+        UDim2.fromOffset(0, 0),
+        function()
+            showInputDialog("Rename project", project.name, "Rename", function(value)
+                local oldName = project.name
+                project.name = value
+                project.updated = os.time()
+                local ok, message = saveProjects()
+                refreshProjects()
+                log(ok and "Success" or "Warning", ok and ("Renamed " .. oldName .. " to " .. value) or message)
+                return true
+            end)
+        end,
+        C.panel2
+    )
+    renameButton.LayoutOrder = 2
+    renameButton.ZIndex = 6
+    renameButton.TextSize = 10
+
+    local deleteButton = button(
+        actionBar,
+        "Delete",
+        UDim2.fromOffset(68, 27),
+        UDim2.fromOffset(0, 0),
+        function()
+            local removedName = project.name
+            for index, item in ipairs(projects) do
+                if item.id == project.id then
+                    table.remove(projects, index)
+                    break
+                end
+            end
             local ok, message = saveProjects()
             refreshProjects()
-            log(ok and "Success" or "Warning", ok and ("Renamed " .. oldName .. " to " .. value) or message)
-            return true
-        end)
-    end)
+            log(ok and "Success" or "Warning", ok and ("Deleted project " .. removedName) or message)
+        end,
+        Color3.fromRGB(91, 43, 52)
+    )
+    deleteButton.LayoutOrder = 3
+    deleteButton.ZIndex = 6
+    deleteButton.TextSize = 10
 
-    button(card, "×", UDim2.fromOffset(28, 27), UDim2.new(1, -39, 0.5, -13), function()
-        local removedName = project.name
-        for index, item in ipairs(projects) do
-            if item.id == project.id then table.remove(projects, index) break end
-        end
-        saveProjects()
-        refreshProjects()
-        log("Info", "Deleted project " .. removedName)
-    end, C.panel2)
+    -- Expose the controls in the card for easy visual/debug inspection.
+    card:SetAttribute("HasOpenButton", true)
+    card:SetAttribute("HasRenameButton", true)
+    card:SetAttribute("HasDeleteButton", true)
 end
 
 refreshProjects = function()
