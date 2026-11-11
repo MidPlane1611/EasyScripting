@@ -1,5 +1,5 @@
 --[[
-    Easy Scripting v1.2
+    Easy Scripting v1.3
     Built from the user's original, working v0.1 source.
 
     Main features:
@@ -11,17 +11,17 @@
       * Execute page only lists .lua and .luau files
       * Run Script button performs syntax compilation only
       * Separate movable Console with line-aware errors
-      * Tools menu: scoped Dex Explorer, scoped RemoteSpy, camera-only FreeCam
+      * Tools menu: full client-visible Dex Explorer, instrumented RemoteSpy, camera-only FreeCam
       * Expanding code editor with horizontal and vertical scrolling
       * ASCII-only file/folder labels and mobile Enter button
       * Mobile touch-friendly controls
       * Executor file persistence when readfile/writefile are available
 
     SAFETY / SCOPE:
-      * Dex Explorer only displays Workspace.EasyScriptingTestObjects.
-      * RemoteSpy only listens to incoming RemoteEvents under
-        ReplicatedStorage.EasyScriptingRemotes.
-      * These folders are intended for projects you own or are allowed to test.
+      * Dex displays the client-visible game hierarchy, with a read-only Properties panel.
+      * Script source viewing obeys Roblox client source-access restrictions; RegisterSource
+        is available for source text supplied by your own authorized development setup.
+      * RemoteSpy records calls explicitly routed through its API for your own test projects.
       * FreeCam moves only the camera; it never moves the character's root part.
 ]]
 
@@ -30,7 +30,6 @@ local HttpService = game:GetService("HttpService")
 local UserInputService = game:GetService("UserInputService")
 local TextService = game:GetService("TextService")
 local RunService = game:GetService("RunService")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local LocalPlayer = Players.LocalPlayer
 if not LocalPlayer then
@@ -41,7 +40,7 @@ end
 local ROOT_FOLDER = "EasyScripting"
 local DATA_FILE = ROOT_FOLDER .. "/projects.json"
 local GUI_NAME = "EasyScriptingGui"
-local VERSION = "v1.2"
+local VERSION = "v1.3"
 
 local COLORS = {
     Background = Color3.fromRGB(18, 20, 27),
@@ -1951,7 +1950,13 @@ local function makeToolWindow(name, titleText, width, height, onClose)
     addCorner(bar, 10)
     local title = createLabel(bar, "  " .. titleText, UDim2.new(1, -48, 1, 0), UDim2.fromOffset(6, 0), 13, COLORS.Text, Enum.Font.GothamBold)
     title.ZIndex = 52
-    local close = createButton(bar, "X", UDim2.fromOffset(28, 26), UDim2.new(1, -34, 0, 6), onClose)
+    local close = createButton(bar, "X", UDim2.fromOffset(28, 26), UDim2.new(1, -34, 0, 6), function()
+        if onClose then
+            onClose()
+        else
+            frame.Visible = false
+        end
+    end)
     close.TextSize = 18
     close.ZIndex = 52
     local content = make("Frame", {
@@ -1975,309 +1980,1039 @@ local function objectPath(object)
     return "game." .. table.concat(names, ".")
 end
 
--- Dex reads only the explicitly designated folder in the user's own test place.
+-- Dex: full client-visible Explorer + Properties + source viewer.
 local dexWindow = nil
+local scriptViewerWindows = {}
+local registeredScriptSources = setmetatable({}, {__mode = "k"})
+
+local function getSharedEnvironment()
+    local sharedEnvironment = nil
+    pcall(function()
+        if type(getgenv) == "function" then
+            sharedEnvironment = getgenv()
+        else
+            sharedEnvironment = _G
+        end
+    end)
+    return sharedEnvironment
+end
+
+local dexAPI = {}
+function dexAPI.RegisterSource(scriptObject, sourceText)
+    if typeof(scriptObject) ~= "Instance" then
+        return false, "The first argument must be an Instance."
+    end
+    if type(sourceText) ~= "string" then
+        return false, "The source must be a string."
+    end
+    local className = scriptObject.ClassName
+    if className ~= "Script" and className ~= "LocalScript" and className ~= "ModuleScript" then
+        return false, "Only Script, LocalScript, and ModuleScript are supported."
+    end
+    registeredScriptSources[scriptObject] = sourceText
+    return true
+end
+
+local sharedEnvironment = getSharedEnvironment()
+if sharedEnvironment then
+    pcall(function()
+        sharedEnvironment.EasyScriptingDex = dexAPI
+    end)
+end
+
+local function safeChildren(object)
+    local ok, children = pcall(function()
+        return object:GetChildren()
+    end)
+    if ok and type(children) == "table" then
+        table.sort(children, function(a, b)
+            local aName = tostring(a.Name):lower()
+            local bName = tostring(b.Name):lower()
+            if aName == bName then
+                return a.ClassName < b.ClassName
+            end
+            return aName < bName
+        end)
+        return children
+    end
+    return {}
+end
+
+local function classBadge(className)
+    local badges = {
+        Workspace = {"WS", Color3.fromRGB(73, 153, 105)},
+        Folder = {"FD", Color3.fromRGB(211, 166, 74)},
+        Model = {"MD", Color3.fromRGB(95, 145, 205)},
+        Part = {"PT", Color3.fromRGB(125, 137, 157)},
+        MeshPart = {"MP", Color3.fromRGB(125, 137, 157)},
+        Script = {"SC", Color3.fromRGB(225, 164, 75)},
+        LocalScript = {"LS", Color3.fromRGB(225, 164, 75)},
+        ModuleScript = {"MS", Color3.fromRGB(225, 164, 75)},
+        RemoteEvent = {"RE", Color3.fromRGB(206, 126, 75)},
+        RemoteFunction = {"RF", Color3.fromRGB(206, 126, 75)},
+        BindableEvent = {"BE", Color3.fromRGB(160, 125, 205)},
+        BindableFunction = {"BF", Color3.fromRGB(160, 125, 205)},
+        ScreenGui = {"UI", Color3.fromRGB(91, 157, 205)},
+        Player = {"PL", Color3.fromRGB(93, 170, 145)},
+        Camera = {"CM", Color3.fromRGB(120, 150, 190)},
+        Humanoid = {"HM", Color3.fromRGB(93, 170, 145)},
+        Sound = {"AU", Color3.fromRGB(154, 128, 207)},
+    }
+    if badges[className] then
+        return badges[className][1], badges[className][2]
+    end
+    if className:find("Value") then
+        return "VL", Color3.fromRGB(143, 170, 105)
+    end
+    if className:find("Service") then
+        return "SV", Color3.fromRGB(80, 145, 175)
+    end
+    return string.sub(className, 1, 2):upper(), COLORS.Muted
+end
+
+local function createDexIcon(parent, className, position, zIndex)
+    local code, color = classBadge(className)
+    local root = make("Frame", {
+        Size = UDim2.fromOffset(19, 19),
+        Position = position,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = zIndex or 55,
+    }, parent)
+
+    local function shape(size, offset, fill, radius, rotation)
+        local item = make("Frame", {
+            Size = size,
+            Position = offset,
+            BackgroundColor3 = fill,
+            BorderSizePixel = 0,
+            Rotation = rotation or 0,
+            ZIndex = (zIndex or 55) + 1,
+        }, root)
+        if radius then addCorner(item, radius) end
+        return item
+    end
+
+    if className == "Folder" then
+        shape(UDim2.fromOffset(9, 4), UDim2.fromOffset(2, 3), color, 2)
+        shape(UDim2.fromOffset(15, 10), UDim2.fromOffset(2, 6), color, 2)
+    elseif className == "Script" or className == "LocalScript" or className == "ModuleScript" then
+        local paper = shape(UDim2.fromOffset(12, 16), UDim2.fromOffset(4, 1), Color3.fromRGB(218, 224, 232), 2)
+        paper.ZIndex = (zIndex or 55) + 1
+        local stripeColor = className == "LocalScript" and Color3.fromRGB(80, 172, 134)
+            or (className == "ModuleScript" and Color3.fromRGB(106, 143, 216) or Color3.fromRGB(218, 157, 67))
+        shape(UDim2.fromOffset(2, 16), UDim2.fromOffset(4, 1), stripeColor, 1)
+        shape(UDim2.fromOffset(7, 1), UDim2.fromOffset(7, 6), Color3.fromRGB(88, 99, 115), 1)
+        shape(UDim2.fromOffset(7, 1), UDim2.fromOffset(7, 9), Color3.fromRGB(88, 99, 115), 1)
+        shape(UDim2.fromOffset(5, 1), UDim2.fromOffset(7, 12), Color3.fromRGB(88, 99, 115), 1)
+    elseif className == "RemoteEvent" or className == "RemoteFunction" or className == "BindableEvent" or className == "BindableFunction" then
+        shape(UDim2.fromOffset(13, 13), UDim2.fromOffset(3, 3), color, 7)
+        shape(UDim2.fromOffset(7, 3), UDim2.fromOffset(6, 8), COLORS.Background, 2)
+    elseif className == "Model" then
+        shape(UDim2.fromOffset(8, 8), UDim2.fromOffset(2, 5), color, 2)
+        shape(UDim2.fromOffset(8, 8), UDim2.fromOffset(8, 2), color, 2)
+    elseif className == "Part" or className == "MeshPart" or className:find("Part") then
+        shape(UDim2.fromOffset(12, 12), UDim2.fromOffset(3, 3), color, 2, 0)
+        shape(UDim2.fromOffset(6, 1), UDim2.fromOffset(6, 8), COLORS.Background, 1)
+    elseif className:find("Service") or className == "Workspace" or className == "Players" or className == "Lighting" then
+        shape(UDim2.fromOffset(14, 5), UDim2.fromOffset(2, 3), color, 2)
+        shape(UDim2.fromOffset(14, 5), UDim2.fromOffset(2, 10), color, 2)
+    else
+        local tile = shape(UDim2.fromOffset(16, 16), UDim2.fromOffset(1, 1), color, 4)
+        local label = createLabel(tile, code, UDim2.fromScale(1, 1), UDim2.new(), 7, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+        label.TextXAlignment = Enum.TextXAlignment.Center
+        label.ZIndex = (zIndex or 55) + 2
+    end
+    return root
+end
+
+local function formatPropertyValue(value)
+    local valueType = typeof(value)
+    if valueType == "Instance" then
+        return value.Name .. " [" .. value.ClassName .. "]"
+    elseif valueType == "Color3" then
+        return string.format("R:%d G:%d B:%d", math.floor(value.R * 255 + 0.5), math.floor(value.G * 255 + 0.5), math.floor(value.B * 255 + 0.5))
+    elseif valueType == "Vector3" then
+        return string.format("%.3f, %.3f, %.3f", value.X, value.Y, value.Z)
+    elseif valueType == "Vector2" then
+        return string.format("%.3f, %.3f", value.X, value.Y)
+    elseif valueType == "EnumItem" then
+        return tostring(value):gsub("^Enum%.", "")
+    elseif valueType == "string" then
+        return value == "" and '""' or value
+    end
+    return tostring(value)
+end
+
+local function openScriptNotepad(scriptObject)
+    local sourceText = registeredScriptSources[scriptObject]
+    local sourceNote = nil
+    if type(sourceText) ~= "string" then
+        local ok, result = pcall(function()
+            return scriptObject.Source
+        end)
+        if ok and type(result) == "string" then
+            sourceText = result
+        else
+            sourceNote = "Roblox does not expose this Script.Source to the client.\n\nFor a script you own, provide its source to the viewer from your authorized development setup with:\n\ngetgenv().EasyScriptingDex.RegisterSource(scriptInstance, [[\n-- your source code\n]])\n\nThe viewer does not bypass Roblox source-access restrictions."
+            sourceText = sourceNote
+        end
+    end
+
+    local width = math.max(300, math.min(820, viewport.X - 36))
+    local height = math.max(240, math.min(600, viewport.Y - 50))
+    local frame, content
+    frame, content = makeToolWindow("DexNotepad_" .. tostring(#scriptViewerWindows + 1), "Notepad - " .. scriptObject.Name, width, height, function()
+        frame.Visible = false
+    end)
+    table.insert(scriptViewerWindows, frame)
+
+    local pathLabel = createLabel(content, objectPath(scriptObject), UDim2.new(1, -4, 0, 22), UDim2.fromOffset(0, 0), 9, COLORS.Muted, Enum.Font.Code)
+    pathLabel.ZIndex = 53
+
+    local scroll = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(0, 27),
+        Size = UDim2.new(1, 0, 1, -27),
+        BackgroundColor3 = COLORS.Panel,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 7,
+        ScrollBarImageColor3 = COLORS.Muted,
+        ScrollingDirection = Enum.ScrollingDirection.XY,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        ZIndex = 52,
+    }, content)
+    addCorner(scroll, 7)
+
+    local noteBox = make("TextBox", {
+        Name = "SourceText",
+        Position = UDim2.fromOffset(8, 8),
+        Size = UDim2.fromOffset(600, 300),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ClearTextOnFocus = false,
+        MultiLine = true,
+        TextEditable = false,
+        Text = sourceText,
+        TextColor3 = sourceNote and COLORS.Yellow or COLORS.Text,
+        TextSize = 12,
+        Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = false,
+        ZIndex = 53,
+    }, scroll)
+
+    local maxLineWidth = 500
+    local lineCount = 1
+    for line in (sourceText .. "\n"):gmatch("(.-)\n") do
+        lineCount = lineCount + 1
+        local ok, measured = pcall(function()
+            return TextService:GetTextSize(line, 12, Enum.Font.Code, Vector2.new(100000, 30))
+        end)
+        if ok then
+            maxLineWidth = math.max(maxLineWidth, measured.X)
+        end
+    end
+    local contentWidth = math.max(scroll.AbsoluteSize.X - 16, maxLineWidth + 22)
+    local contentHeight = math.max(scroll.AbsoluteSize.Y - 16, lineCount * 17 + 20)
+    noteBox.Size = UDim2.fromOffset(contentWidth, contentHeight)
+    scroll.CanvasSize = UDim2.fromOffset(contentWidth + 16, contentHeight + 16)
+    raiseZIndex(frame, 60)
+end
+
 local function openDex()
     if dexWindow then
         dexWindow.Visible = true
+        raiseZIndex(dexWindow, 50)
         return
     end
 
-    local width = math.max(280, math.min(520, windowWidth - 30))
-    local height = math.max(230, math.min(390, windowHeight - 80))
-    local selectedObject = nil
-    local expanded = {}
+    local width = math.max(300, math.min(940, viewport.X - 28))
+    local height = math.max(260, math.min(650, viewport.Y - 36))
+    local selectedObject = game
+    local expanded = {[game] = true}
+    local clickTimes = setmetatable({}, {__mode = "k"})
+    local frame, content
     local treeList
-    local detailLabel
-    local renderDexTree
+    local propertiesList
+    local renderTree
+    local updateProperties
+    local searchBox
 
-    dexWindow = nil
-    local frame, content = makeToolWindow("DexExplorerWindow", "Dex Explorer - test folder", width, height, function()
+    frame, content = makeToolWindow("DexExplorerWindow", "Dex Explorer", width, height, function()
         frame.Visible = false
     end)
     dexWindow = frame
 
-    local refreshButton = createButton(content, "Refresh", UDim2.fromOffset(72, 26), UDim2.new(1, -72, 0, 0), function()
-        renderDexTree()
-    end)
-    refreshButton.ZIndex = 53
+    local toolbar = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 32),
+        BackgroundTransparency = 1,
+        ZIndex = 53,
+    }, content)
+    local searchWrap = make("Frame", {
+        Size = UDim2.new(1, -86, 1, 0),
+        BackgroundColor3 = COLORS.Panel2,
+        BorderSizePixel = 0,
+        ZIndex = 53,
+    }, toolbar)
+    addCorner(searchWrap, 6)
+    searchBox = make("TextBox", {
+        Size = UDim2.new(1, -12, 1, 0),
+        Position = UDim2.fromOffset(7, 0),
+        BackgroundTransparency = 1,
+        ClearTextOnFocus = false,
+        PlaceholderText = "Search all client-visible objects...",
+        Text = "",
+        TextColor3 = COLORS.Text,
+        PlaceholderColor3 = COLORS.Muted,
+        TextSize = 10,
+        Font = Enum.Font.Gotham,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 54,
+    }, searchWrap)
+    local refresh = createButton(toolbar, "Refresh", UDim2.fromOffset(78, 30), UDim2.new(1, -78, 0, 0), function()
+        renderTree()
+        updateProperties(selectedObject)
+    end, COLORS.Panel2)
+    refresh.ZIndex = 54
 
+    local dividerX = width < 520 and 0.53 or 0.55
     treeList = make("ScrollingFrame", {
-        Position = UDim2.fromOffset(0, 32),
-        Size = UDim2.new(0.56, -5, 1, -32),
+        Name = "ExplorerTree",
+        Position = UDim2.fromOffset(0, 38),
+        Size = UDim2.new(dividerX, -5, 1, -38),
         BackgroundColor3 = COLORS.Panel,
         BorderSizePixel = 0,
-        ScrollBarThickness = 4,
+        ScrollBarThickness = 7,
+        ScrollBarImageColor3 = COLORS.Muted,
         CanvasSize = UDim2.fromOffset(0, 0),
         ZIndex = 52,
     }, content)
     addCorner(treeList, 7)
-    local treeLayout = make("UIListLayout", {Padding = UDim.new(0, 3), SortOrder = Enum.SortOrder.LayoutOrder}, treeList)
+    local treeLayout = make("UIListLayout", {Padding = UDim.new(0, 1), SortOrder = Enum.SortOrder.LayoutOrder}, treeList)
     treeLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        treeList.CanvasSize = UDim2.fromOffset(0, treeLayout.AbsoluteContentSize.Y + 6)
+        treeList.CanvasSize = UDim2.fromOffset(0, treeLayout.AbsoluteContentSize.Y + 8)
     end)
 
-    local detailPanel = make("Frame", {
-        Position = UDim2.new(0.56, 5, 0, 32),
-        Size = UDim2.new(0.44, -5, 1, -32),
+    local propertiesPanel = make("Frame", {
+        Position = UDim2.new(dividerX, 5, 0, 38),
+        Size = UDim2.new(1 - dividerX, -5, 1, -38),
         BackgroundColor3 = COLORS.Panel,
         BorderSizePixel = 0,
         ZIndex = 52,
     }, content)
-    addCorner(detailPanel, 7)
-    detailLabel = createLabel(detailPanel, "Select an object.", UDim2.new(1, -14, 1, -14), UDim2.fromOffset(7, 7), 10, COLORS.Text, Enum.Font.Code)
-    detailLabel.TextWrapped = true
-    detailLabel.TextYAlignment = Enum.TextYAlignment.Top
-    detailLabel.ZIndex = 53
+    addCorner(propertiesPanel, 7)
+    local propertiesTitle = createLabel(propertiesPanel, "  Properties", UDim2.new(1, -12, 0, 25), UDim2.fromOffset(6, 1), 11, COLORS.Text, Enum.Font.GothamBold)
+    propertiesTitle.ZIndex = 54
+    propertiesList = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(4, 28),
+        Size = UDim2.new(1, -8, 1, -32),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 6,
+        ScrollBarImageColor3 = COLORS.Muted,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        ZIndex = 53,
+    }, propertiesPanel)
+    local propertiesLayout = make("UIListLayout", {Padding = UDim.new(0, 2), SortOrder = Enum.SortOrder.LayoutOrder}, propertiesList)
+    propertiesLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        propertiesList.CanvasSize = UDim2.fromOffset(0, propertiesLayout.AbsoluteContentSize.Y + 8)
+    end)
 
-    local function updateDetails(object)
-        if not object then
-            detailLabel.Text = "Create this folder in your own test place:\n\nWorkspace\n- EasyScriptingTestObjects\n\nPlace Parts and Models inside it, then press Refresh."
-            return
-        end
-        local lines = {
-            "Name: " .. object.Name,
-            "Class: " .. object.ClassName,
-            "Parent: " .. (object.Parent and object.Parent.Name or "nil"),
-            "Path: " .. objectPath(object),
-            "Children: " .. tostring(#object:GetChildren()),
-        }
-        if object:IsA("BasePart") then
-            local position = object.Position
-            local size = object.Size
-            table.insert(lines, string.format("Position: %.2f, %.2f, %.2f", position.X, position.Y, position.Z))
-            table.insert(lines, string.format("Size: %.2f, %.2f, %.2f", size.X, size.Y, size.Z))
-        elseif object:IsA("ValueBase") then
-            table.insert(lines, "Value: " .. tostring(object.Value))
-        end
-        detailLabel.Text = table.concat(lines, "\n\n")
-    end
-
-    renderDexTree = function()
-        for _, child in ipairs(treeList:GetChildren()) do
-            if child:IsA("GuiObject") then child:Destroy() end
-        end
-        local root = workspace:FindFirstChild("EasyScriptingTestObjects")
-        if not root then
-            selectedObject = nil
-            updateDetails(nil)
-            local note = createLabel(treeList, "Test folder not found", UDim2.new(1, -12, 0, 40), UDim2.fromOffset(6, 5), 10, COLORS.Yellow)
-            note.ZIndex = 54
-            return
-        end
-        if not selectedObject or not selectedObject:IsDescendantOf(root) then
-            selectedObject = root
-        end
-        local order = 0
-        local function addNode(object, depth)
-            order = order + 1
-            local children = object:GetChildren()
-            table.sort(children, function(a, b)
-                if a.ClassName == b.ClassName then return a.Name:lower() < b.Name:lower() end
-                return a.ClassName < b.ClassName
-            end)
-            local isExpanded = expanded[object] ~= false
-            local prefix = #children > 0 and (isExpanded and "DIR- " or "DIR+ ") or "ITEM "
-            local row = make("TextButton", {
-                Size = UDim2.new(1, -5, 0, 24),
-                BackgroundColor3 = selectedObject == object and COLORS.PanelHover or COLORS.Panel2,
-                BorderSizePixel = 0,
-                Text = string.rep("  ", math.min(depth, 5)) .. prefix .. object.Name .. " [" .. object.ClassName .. "]",
-                TextColor3 = COLORS.Text,
-                TextSize = 9,
-                Font = Enum.Font.Code,
-                TextXAlignment = Enum.TextXAlignment.Left,
-                LayoutOrder = order,
-                AutoButtonColor = true,
-                ZIndex = 54,
-            }, treeList)
-            addCorner(row, 4)
-            row.Activated:Connect(function()
-                selectedObject = object
-                if #children > 0 then expanded[object] = not isExpanded end
-                updateDetails(object)
-                renderDexTree()
-            end)
-            if isExpanded then
-                for _, child in ipairs(children) do
-                    addNode(child, depth + 1)
-                end
+    local function clearGuiRows(container)
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("GuiObject") and not child:IsA("UIListLayout") then
+                child:Destroy()
             end
         end
-        expanded[root] = expanded[root] ~= false
-        addNode(root, 0)
-        updateDetails(selectedObject)
     end
 
-    renderDexTree()
+    local function addPropertyCategory(title, order)
+        local label = createLabel(propertiesList, title:upper(), UDim2.new(1, -8, 0, 22), UDim2.new(), 9, COLORS.Blue, Enum.Font.GothamBold)
+        label.LayoutOrder = order
+        label.ZIndex = 55
+        local line = make("Frame", {
+            Size = UDim2.new(1, -8, 0, 1),
+            BackgroundColor3 = COLORS.Border,
+            BorderSizePixel = 0,
+            LayoutOrder = order + 1,
+            ZIndex = 54,
+        }, propertiesList)
+        return order + 2
+    end
+
+    local function addPropertyRow(name, value, order)
+        local row = make("Frame", {
+            Size = UDim2.new(1, -8, 0, 27),
+            BackgroundColor3 = order % 2 == 0 and COLORS.Panel2 or COLORS.Panel,
+            BorderSizePixel = 0,
+            LayoutOrder = order,
+            ZIndex = 54,
+        }, propertiesList)
+        local keyLabel = createLabel(row, name, UDim2.new(0.43, -4, 1, 0), UDim2.fromOffset(6, 0), 9, COLORS.Muted)
+        keyLabel.ZIndex = 55
+        local valueLabel = createLabel(row, tostring(value), UDim2.new(0.57, -8, 1, 0), UDim2.new(0.43, 0, 0, 0), 9, COLORS.Text, Enum.Font.Code)
+        valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
+        valueLabel.ZIndex = 55
+        return order + 1
+    end
+
+    updateProperties = function(object)
+        clearGuiRows(propertiesList)
+        local order = 1
+        if not object then
+            order = addPropertyCategory("Selection", order)
+            addPropertyRow("Object", "Nothing selected", order)
+            return
+        end
+        propertiesTitle.Text = "  Properties - " .. object.Name
+        order = addPropertyCategory("Instance", order)
+        order = addPropertyRow("Name", object.Name, order)
+        order = addPropertyRow("ClassName", object.ClassName, order)
+        order = addPropertyRow("Parent", object.Parent and object.Parent.Name or "nil", order)
+        order = addPropertyRow("Path", objectPath(object), order)
+        local archivableOk, archivable = pcall(function() return object.Archivable end)
+        if archivableOk then order = addPropertyRow("Archivable", tostring(archivable), order) end
+        order = addPropertyRow("Children", tostring(#safeChildren(object)), order)
+
+        if object:IsA("BasePart") then
+            order = addPropertyCategory("Transform", order + 1)
+            order = addPropertyRow("Position", formatPropertyValue(object.Position), order)
+            order = addPropertyRow("Orientation", formatPropertyValue(object.Orientation), order)
+            order = addPropertyRow("Size", formatPropertyValue(object.Size), order)
+            order = addPropertyCategory("Appearance", order + 1)
+            order = addPropertyRow("Color", formatPropertyValue(object.Color), order)
+            order = addPropertyRow("Material", formatPropertyValue(object.Material), order)
+            order = addPropertyRow("Transparency", formatPropertyValue(object.Transparency), order)
+            order = addPropertyRow("Reflectance", formatPropertyValue(object.Reflectance), order)
+            order = addPropertyCategory("Behavior", order + 1)
+            order = addPropertyRow("Anchored", tostring(object.Anchored), order)
+            order = addPropertyRow("CanCollide", tostring(object.CanCollide), order)
+            order = addPropertyRow("CanTouch", tostring(object.CanTouch), order)
+            order = addPropertyRow("CanQuery", tostring(object.CanQuery), order)
+        elseif object:IsA("ValueBase") then
+            order = addPropertyCategory("Value", order + 1)
+            order = addPropertyRow("Value", formatPropertyValue(object.Value), order)
+        elseif object:IsA("Humanoid") then
+            order = addPropertyCategory("Humanoid", order + 1)
+            order = addPropertyRow("DisplayName", object.DisplayName, order)
+            order = addPropertyRow("Health", tostring(object.Health), order)
+            order = addPropertyRow("MaxHealth", tostring(object.MaxHealth), order)
+            order = addPropertyRow("WalkSpeed", tostring(object.WalkSpeed), order)
+            order = addPropertyRow("JumpPower", tostring(object.JumpPower), order)
+            order = addPropertyRow("RigType", tostring(object.RigType), order)
+        elseif object:IsA("GuiObject") then
+            order = addPropertyCategory("Gui", order + 1)
+            order = addPropertyRow("Visible", tostring(object.Visible), order)
+            order = addPropertyRow("Position", formatPropertyValue(object.Position), order)
+            order = addPropertyRow("Size", formatPropertyValue(object.Size), order)
+            order = addPropertyRow("AnchorPoint", formatPropertyValue(object.AnchorPoint), order)
+            order = addPropertyRow("BackgroundColor3", formatPropertyValue(object.BackgroundColor3), order)
+            order = addPropertyRow("BackgroundTransparency", tostring(object.BackgroundTransparency), order)
+            if object:IsA("TextLabel") or object:IsA("TextButton") or object:IsA("TextBox") then
+                order = addPropertyRow("Text", object.Text, order)
+                order = addPropertyRow("TextSize", tostring(object.TextSize), order)
+            end
+        elseif object:IsA("Sound") then
+            order = addPropertyCategory("Sound", order + 1)
+            order = addPropertyRow("SoundId", object.SoundId, order)
+            order = addPropertyRow("Volume", tostring(object.Volume), order)
+            order = addPropertyRow("PlaybackSpeed", tostring(object.PlaybackSpeed), order)
+            order = addPropertyRow("Playing", tostring(object.Playing), order)
+        end
+
+        local attributesOk, attributes = pcall(function() return object:GetAttributes() end)
+        if attributesOk and next(attributes) then
+            order = addPropertyCategory("Attributes", order + 1)
+            local names = {}
+            for attributeName in pairs(attributes) do table.insert(names, attributeName) end
+            table.sort(names)
+            for _, attributeName in ipairs(names) do
+                order = addPropertyRow(attributeName, formatPropertyValue(attributes[attributeName]), order)
+            end
+        end
+        local tagsOk, tags = pcall(function()
+            return game:GetService("CollectionService"):GetTags(object)
+        end)
+        if tagsOk and #tags > 0 then
+            table.sort(tags)
+            order = addPropertyCategory("Tags", order + 1)
+            order = addPropertyRow("CollectionService", table.concat(tags, ", "), order)
+        end
+    end
+
+    local function addTreeRow(object, depth, order, searchablePath)
+        local children = safeChildren(object)
+        local isExpanded = expanded[object] == true
+        local indent = math.min(depth * 13, 150)
+        local row = make("Frame", {
+            Size = UDim2.new(1, -5, 0, 24),
+            BackgroundColor3 = selectedObject == object and COLORS.PanelHover or COLORS.Panel,
+            BorderSizePixel = 0,
+            LayoutOrder = order,
+            ZIndex = 54,
+        }, treeList)
+        local expander = createButton(row, #children > 0 and (isExpanded and "v" or ">") or " ", UDim2.fromOffset(15, 22), UDim2.fromOffset(indent, 1), function()
+            if #children > 0 then
+                expanded[object] = not isExpanded
+                renderTree()
+            end
+        end, COLORS.Panel)
+        expander.TextSize = 10
+        expander.ZIndex = 56
+
+        createDexIcon(row, object.ClassName, UDim2.fromOffset(indent + 16, 2), 55)
+
+        local rowText = searchablePath or object.Name
+        local selectButton = make("TextButton", {
+            Size = UDim2.new(1, -(indent + 40), 1, 0),
+            Position = UDim2.fromOffset(indent + 39, 0),
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Text = rowText .. (searchablePath and ("  [" .. object.ClassName .. "]") or ""),
+            TextColor3 = COLORS.Text,
+            TextSize = 9,
+            Font = Enum.Font.Code,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            AutoButtonColor = true,
+            ZIndex = 55,
+        }, row)
+        selectButton.Activated:Connect(function()
+            local now = os.clock()
+            local lastTap = clickTimes[object] or 0
+            local doubleTap = now - lastTap <= 0.38
+            clickTimes[object] = now
+            selectedObject = object
+            updateProperties(object)
+            renderTree()
+            if doubleTap and (object.ClassName == "Script" or object.ClassName == "LocalScript" or object.ClassName == "ModuleScript") then
+                openScriptNotepad(object)
+            end
+        end)
+        if not searchablePath and isExpanded then
+            for _, child in ipairs(children) do
+                order = order + 1
+                if order > 3500 then break end
+                order = addTreeRow(child, depth + 1, order, nil)
+            end
+        end
+        return order
+    end
+
+    renderTree = function()
+        clearGuiRows(treeList)
+        local query = string.lower(searchBox.Text or "")
+        local order = 0
+        if query ~= "" then
+            local ok, descendants = pcall(function() return game:GetDescendants() end)
+            local matches = {}
+            if ok then
+                for _, object in ipairs(descendants) do
+                    local name = string.lower(object.Name)
+                    if string.find(name, query, 1, true) then
+                        table.insert(matches, object)
+                        if #matches >= 1200 then break end
+                    end
+                end
+            end
+            table.sort(matches, function(a, b) return objectPath(a):lower() < objectPath(b):lower() end)
+            for _, object in ipairs(matches) do
+                order = order + 1
+                addTreeRow(object, 0, order, objectPath(object))
+            end
+            if #matches == 0 then
+                local empty = createLabel(treeList, "No matching objects", UDim2.new(1, -12, 0, 30), UDim2.fromOffset(6, 4), 10, COLORS.Muted)
+                empty.LayoutOrder = 1
+                empty.ZIndex = 55
+            end
+        else
+            order = addTreeRow(game, 0, 1, nil)
+        end
+        updateProperties(selectedObject)
+    end
+
+    searchBox:GetPropertyChangedSignal("Text"):Connect(renderTree)
+    renderTree()
     raiseZIndex(dexWindow, 50)
 end
 
--- RemoteSpy listens only to incoming RemoteEvents in the designated test folder.
+-- RemoteSpy is an explicit instrumentation API for remotes in projects the user owns or may test.
+-- It does not hook or intercept arbitrary remote calls in other experiences.
 local remoteSpyWindow = nil
+local remoteSpyAPI = nil
+local remoteSpyState = {
+    recording = false,
+    groups = {},
+    groupOrder = {},
+    selectedKey = nil,
+    activeDirection = "Outgoing",
+    maxGroups = 100,
+    maxHistory = 250,
+}
+
+local function safeSerialize(value, depth, seen)
+    depth = depth or 0
+    seen = seen or {}
+    local valueType = typeof(value)
+    if valueType == "string" then
+        local safe = value:gsub("\n", "\\n")
+        if #safe > 180 then safe = string.sub(safe, 1, 177) .. "..." end
+        return string.format("%q", safe), "string"
+    elseif valueType == "Instance" then
+        return objectPath(value), "Instance<" .. value.ClassName .. ">"
+    elseif valueType == "table" then
+        if seen[value] then return "<cycle>", "table" end
+        if depth >= 2 then return "{...}", "table" end
+        seen[value] = true
+        local parts = {}
+        local count = 0
+        for key, item in pairs(value) do
+            count = count + 1
+            if count > 10 then
+                table.insert(parts, "...")
+                break
+            end
+            local keyText = type(key) == "string" and key or ("[" .. tostring(key) .. "]")
+            local itemText = safeSerialize(item, depth + 1, seen)
+            table.insert(parts, tostring(keyText) .. " = " .. tostring(itemText))
+        end
+        seen[value] = nil
+        return "{" .. table.concat(parts, ", ") .. "}", "table"
+    elseif valueType == "function" then
+        return "<function>", "function"
+    elseif valueType == "thread" then
+        return "<thread>", "thread"
+    end
+    local ok, textValue = pcall(tostring, value)
+    return ok and textValue or "<unavailable>", valueType
+end
+
+local function captureCallSource()
+    local debugLibrary = debug
+    if type(debugLibrary) == "table" and type(debugLibrary.info) == "function" then
+        local ok, source, line = pcall(debugLibrary.info, 3, "sl")
+        if ok and source then
+            return tostring(source) .. (line and (":" .. tostring(line)) or "")
+        end
+    end
+    return "Not available (instrumented wrapper)"
+end
+
+local function packArguments(...)
+    local packed = table.pack(...)
+    local result = {}
+    for index = 1, packed.n do
+        local valueText, valueType = safeSerialize(packed[index])
+        table.insert(result, {
+            index = index,
+            valueType = valueType,
+            value = valueText,
+        })
+    end
+    return result
+end
+
+local function remoteGroupKey(direction, remote, method)
+    return direction .. "|" .. objectPath(remote) .. "|" .. method
+end
+
+local function recordRemoteCall(direction, remote, method, args, results, source)
+    if not remoteSpyState.recording then return end
+    local key = remoteGroupKey(direction, remote, method)
+    local group = remoteSpyState.groups[key]
+    if not group then
+        group = {
+            key = key,
+            direction = direction,
+            remote = remote,
+            name = remote.Name,
+            path = objectPath(remote),
+            method = method,
+            count = 0,
+            history = {},
+        }
+        remoteSpyState.groups[key] = group
+        table.insert(remoteSpyState.groupOrder, key)
+        while #remoteSpyState.groupOrder > remoteSpyState.maxGroups do
+            local removedKey = table.remove(remoteSpyState.groupOrder, 1)
+            remoteSpyState.groups[removedKey] = nil
+        end
+    end
+    group.count = group.count + 1
+    local resultItems = results and packArguments(table.unpack(results, 1, results.n or #results)) or {}
+    local entry = {
+        time = os.date("%H:%M:%S"),
+        timestamp = os.time(),
+        args = args or {},
+        results = resultItems,
+        source = source or "Not available",
+        activation = group.count,
+    }
+    table.insert(group.history, entry)
+    while #group.history > remoteSpyState.maxHistory do
+        table.remove(group.history, 1)
+    end
+    if remoteSpyState.onChanged then
+        pcall(remoteSpyState.onChanged)
+    end
+end
+
+local function publishRemoteSpyAPI()
+    remoteSpyAPI = {
+        -- Use these wrappers instead of direct calls in your own test scripts.
+        FireServer = function(remote, ...)
+            assert(typeof(remote) == "Instance" and remote:IsA("RemoteEvent"), "FireServer expects a RemoteEvent")
+            recordRemoteCall("Outgoing", remote, "FireServer", packArguments(...), nil, captureCallSource())
+            return remote:FireServer(...)
+        end,
+        InvokeServer = function(remote, ...)
+            assert(typeof(remote) == "Instance" and remote:IsA("RemoteFunction"), "InvokeServer expects a RemoteFunction")
+            local rawArguments = table.pack(...)
+            local args = packArguments(table.unpack(rawArguments, 1, rawArguments.n))
+            local callResults = table.pack(pcall(function()
+                return remote:InvokeServer(table.unpack(rawArguments, 1, rawArguments.n))
+            end))
+            if not callResults[1] then
+                recordRemoteCall("Outgoing", remote, "InvokeServer", args, nil, captureCallSource())
+                error(callResults[2], 0)
+            end
+            local returned = {n = callResults.n - 1}
+            for index = 2, callResults.n do returned[index - 1] = callResults[index] end
+            recordRemoteCall("Outgoing", remote, "InvokeServer", args, returned, captureCallSource())
+            return table.unpack(returned, 1, returned.n)
+        end,
+        ObserveIncoming = function(remote)
+            assert(typeof(remote) == "Instance" and remote:IsA("RemoteEvent"), "ObserveIncoming expects a RemoteEvent")
+            return remote.OnClientEvent:Connect(function(...)
+                recordRemoteCall("Incoming", remote, "OnClientEvent", packArguments(...), nil, "Server -> client")
+            end)
+        end,
+        ConnectIncoming = function(remote, callback)
+            assert(typeof(remote) == "Instance" and remote:IsA("RemoteEvent"), "ConnectIncoming expects a RemoteEvent")
+            assert(type(callback) == "function", "ConnectIncoming expects a callback")
+            return remote.OnClientEvent:Connect(function(...)
+                recordRemoteCall("Incoming", remote, "OnClientEvent", packArguments(...), nil, "Server -> client")
+                callback(...)
+            end)
+        end,
+        BindClientInvoke = function(remote, callback)
+            assert(typeof(remote) == "Instance" and remote:IsA("RemoteFunction"), "BindClientInvoke expects a RemoteFunction")
+            assert(type(callback) == "function", "BindClientInvoke expects a callback")
+            remote.OnClientInvoke = function(...)
+                local args = packArguments(...)
+                local returned = table.pack(callback(...))
+                recordRemoteCall("Incoming", remote, "OnClientInvoke", args, returned, "Server -> client")
+                return table.unpack(returned, 1, returned.n)
+            end
+        end,
+        Record = function(direction, remote, method, ...)
+            assert(direction == "Outgoing" or direction == "Incoming", "Direction must be Outgoing or Incoming")
+            assert(typeof(remote) == "Instance", "Record expects a Remote Instance")
+            recordRemoteCall(direction, remote, method or "Manual", packArguments(...), nil, "Manual record")
+        end,
+        GetStatus = function()
+            return remoteSpyState.recording and "Recording" or "Stopped"
+        end,
+    }
+    local environment = getSharedEnvironment()
+    if environment then
+        pcall(function() environment.EasyScriptingRemoteSpy = remoteSpyAPI end)
+    end
+end
+
 local function openRemoteSpy()
     if remoteSpyWindow then
         remoteSpyWindow.Visible = true
+        raiseZIndex(remoteSpyWindow, 50)
         return
     end
 
-    local width = math.max(280, math.min(520, windowWidth - 30))
-    local height = math.max(230, math.min(390, windowHeight - 80))
+    local width = math.max(300, math.min(940, viewport.X - 28))
+    local height = math.max(260, math.min(650, viewport.Y - 36))
     local frame, content
-    local entries = {}
-    local eventConnections = {}
-    local folderConnection = nil
-    local active = false
-    local list
-    local status
-    local renderEntries
-    local stopConnections
-    frame, content = makeToolWindow("RemoteSpyWindow", "RemoteSpy - own test remotes", width, height, function()
+    local leftList
+    local rightList
+    local statusLabel
+    local startButton
+    local clearButton
+    local searchBox
+    local renderLeft
+    local renderRight
+
+    frame, content = makeToolWindow("RemoteSpyWindow", "RemoteSpy", width, height, function()
+        remoteSpyState.recording = false
+        if statusLabel then statusLabel.Text = "Stopped" end
+        if startButton then startButton.Text = "Start" end
         frame.Visible = false
-        if stopConnections then
-            stopConnections()
-        end
-        if status then status.Text = "Stopped" end
     end)
     remoteSpyWindow = frame
 
-    status = createLabel(content, "Stopped - ReplicatedStorage/EasyScriptingRemotes", UDim2.new(1, -150, 0, 24), UDim2.fromOffset(0, 0), 9, COLORS.Muted)
-    status.ZIndex = 53
-    local startButton = createButton(content, "Start", UDim2.fromOffset(64, 26), UDim2.new(1, -136, 0, 0), nil, COLORS.Green)
-    startButton.ZIndex = 53
-    local clearButton = createButton(content, "Clear", UDim2.fromOffset(60, 26), UDim2.new(1, -66, 0, 0), function()
-        entries = {}
-        renderEntries()
-    end)
-    clearButton.ZIndex = 53
+    local toolbar = make("Frame", {
+        Size = UDim2.new(1, 0, 0, 32),
+        BackgroundTransparency = 1,
+        ZIndex = 53,
+    }, content)
+    local compactToolbar = width < 520
+    local searchWidth = compactToolbar and 58 or 170
+    local apiWidth = compactToolbar and 34 or 42
+    local clearWidth = compactToolbar and 44 or 56
+    local startWidth = compactToolbar and 48 or 58
+    local apiRight = searchWidth + 4
+    local clearRight = apiRight + apiWidth + 4
+    local startRight = clearRight + clearWidth + 4
+    local toolbarRightWidth = startRight + startWidth
+    statusLabel = createLabel(toolbar, "Stopped", UDim2.new(1, -(toolbarRightWidth + 8), 1, 0), UDim2.fromOffset(0, 0), 9, COLORS.Muted)
+    statusLabel.ZIndex = 54
+    startButton = createButton(toolbar, "Start", UDim2.fromOffset(startWidth, 30), UDim2.new(1, -toolbarRightWidth, 0, 0), function()
+        remoteSpyState.recording = not remoteSpyState.recording
+        startButton.Text = remoteSpyState.recording and "Stop" or "Start"
+        statusLabel.Text = remoteSpyState.recording and "Recording instrumented calls" or "Stopped"
+    end, COLORS.Green)
+    startButton.ZIndex = 54
+    clearButton = createButton(toolbar, "Clear", UDim2.fromOffset(clearWidth, 30), UDim2.new(1, -clearRight - clearWidth, 0, 0), function()
+        remoteSpyState.groups = {}
+        remoteSpyState.groupOrder = {}
+        remoteSpyState.selectedKey = nil
+        renderLeft()
+        renderRight()
+    end, COLORS.Panel2)
+    clearButton.ZIndex = 54
+    local helpButton = createButton(toolbar, "API", UDim2.fromOffset(apiWidth, 30), UDim2.new(1, -apiRight - apiWidth, 0, 0), function()
+        logConsole("Info", "RemoteSpy API: getgenv().EasyScriptingRemoteSpy.FireServer(remote, ...), InvokeServer(remote, ...), ObserveIncoming(remote), ConnectIncoming(remote, callback), BindClientInvoke(remote, callback). Use only in your own/authorized test scripts.")
+    end, COLORS.Panel2)
+    helpButton.ZIndex = 54
+    local searchWrap = make("Frame", {
+        Size = UDim2.fromOffset(searchWidth, 30),
+        Position = UDim2.new(1, -searchWidth, 0, 0),
+        BackgroundColor3 = COLORS.Panel2,
+        BorderSizePixel = 0,
+        ZIndex = 53,
+    }, toolbar)
+    addCorner(searchWrap, 6)
+    searchBox = make("TextBox", {
+        Size = UDim2.new(1, -8, 1, 0),
+        Position = UDim2.fromOffset(5, 0),
+        BackgroundTransparency = 1,
+        Text = "",
+        PlaceholderText = "Find remotes...",
+        ClearTextOnFocus = false,
+        TextColor3 = COLORS.Text,
+        PlaceholderColor3 = COLORS.Muted,
+        TextSize = 9,
+        Font = Enum.Font.Gotham,
+        ZIndex = 54,
+    }, searchWrap)
 
-    local help = createLabel(content,
-        "Incoming messages only. Add test RemoteEvents to ReplicatedStorage/EasyScriptingRemotes in your own place.",
-        UDim2.new(1, 0, 0, 34), UDim2.fromOffset(0, 30), 9, COLORS.Muted)
-    help.TextWrapped = true
-    help.ZIndex = 53
-
-    list = make("ScrollingFrame", {
-        Position = UDim2.fromOffset(0, 68),
-        Size = UDim2.new(1, 0, 1, -68),
+    local split = width < 520 and 0.45 or 0.40
+    local leftPanel = make("Frame", {
+        Position = UDim2.fromOffset(0, 38),
+        Size = UDim2.new(split, -5, 1, -38),
         BackgroundColor3 = COLORS.Panel,
         BorderSizePixel = 0,
-        ScrollBarThickness = 4,
-        CanvasSize = UDim2.fromOffset(0, 0),
         ZIndex = 52,
     }, content)
-    addCorner(list, 7)
-    local listLayout = make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, list)
-    listLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
-        list.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y + 6)
+    addCorner(leftPanel, 7)
+    local rightPanel = make("Frame", {
+        Position = UDim2.new(split, 5, 0, 38),
+        Size = UDim2.new(1 - split, -5, 1, -38),
+        BackgroundColor3 = COLORS.Panel,
+        BorderSizePixel = 0,
+        ZIndex = 52,
+    }, content)
+    addCorner(rightPanel, 7)
+
+    local tabs = make("Frame", {
+        Size = UDim2.new(1, -10, 0, 30),
+        Position = UDim2.fromOffset(5, 5),
+        BackgroundColor3 = COLORS.Panel2,
+        BorderSizePixel = 0,
+        ZIndex = 53,
+    }, leftPanel)
+    addCorner(tabs, 6)
+    local outgoingTab = createButton(tabs, "Outgoing", UDim2.new(0.5, -2, 1, 0), UDim2.fromOffset(0, 0), function()
+        remoteSpyState.activeDirection = "Outgoing"
+        renderLeft()
+        renderRight()
+    end, COLORS.Accent)
+    outgoingTab.ZIndex = 54
+    local incomingTab = createButton(tabs, "Incoming", UDim2.new(0.5, -2, 1, 0), UDim2.new(0.5, 2, 0, 0), function()
+        remoteSpyState.activeDirection = "Incoming"
+        renderLeft()
+        renderRight()
+    end, COLORS.Panel2)
+    incomingTab.ZIndex = 54
+
+    leftList = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(5, 40),
+        Size = UDim2.new(1, -10, 1, -45),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 7,
+        ScrollBarImageColor3 = COLORS.Muted,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        ZIndex = 53,
+    }, leftPanel)
+    local leftLayout = make("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, leftList)
+    leftLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        leftList.CanvasSize = UDim2.fromOffset(0, leftLayout.AbsoluteContentSize.Y + 8)
     end)
 
-    renderEntries = function()
-        for _, child in ipairs(list:GetChildren()) do
-            if child:IsA("GuiObject") then child:Destroy() end
-        end
-        for index, entry in ipairs(entries) do
-            local text = string.format("[%s] %s\n%s", entry.time, entry.name, entry.args)
-            local row = createLabel(list, text, UDim2.new(1, -8, 0, 48), UDim2.new(), 9, COLORS.Text, Enum.Font.Code)
-            row.BackgroundColor3 = COLORS.Panel2
-            row.BackgroundTransparency = 0
-            row.TextWrapped = true
-            row.TextYAlignment = Enum.TextYAlignment.Center
-            row.LayoutOrder = index
-            row.ZIndex = 54
-            addCorner(row, 5)
+    local detailsTitle = createLabel(rightPanel, "  Call history", UDim2.new(1, -10, 0, 29), UDim2.fromOffset(5, 3), 11, COLORS.Text, Enum.Font.GothamBold)
+    detailsTitle.ZIndex = 54
+    rightList = make("ScrollingFrame", {
+        Position = UDim2.fromOffset(5, 34),
+        Size = UDim2.new(1, -10, 1, -39),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 7,
+        ScrollBarImageColor3 = COLORS.Muted,
+        CanvasSize = UDim2.fromOffset(0, 0),
+        ZIndex = 53,
+    }, rightPanel)
+    local rightLayout = make("UIListLayout", {Padding = UDim.new(0, 5), SortOrder = Enum.SortOrder.LayoutOrder}, rightList)
+    rightLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        rightList.CanvasSize = UDim2.fromOffset(0, rightLayout.AbsoluteContentSize.Y + 8)
+    end)
+
+    local function clearList(container)
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("GuiObject") and not child:IsA("UIListLayout") then child:Destroy() end
         end
     end
 
-    local function formatArgument(value)
-        local valueType = typeof(value)
-        if valueType == "Instance" then
-            return objectPath(value)
-        elseif valueType == "string" then
-            return string.format("%q", string.sub(value, 1, 100))
-        end
-        return tostring(value)
-    end
-
-    local function formatArgument(value)
-        local valueType = typeof(value)
-        if valueType == "Instance" then
-            return objectPath(value)
-        elseif valueType == "string" then
-            return string.format("%q", string.sub(value, 1, 100))
-        end
-        return tostring(value)
-    end
-
-    local attachRemote
-    stopConnections = function()
-        active = false
-        for _, item in ipairs(eventConnections) do
-            pcall(function() item.connection:Disconnect() end)
-        end
-        eventConnections = {}
-        if folderConnection then
-            pcall(function() folderConnection:Disconnect() end)
-            folderConnection = nil
-        end
-        if startButton and startButton.Parent then startButton.Text = "Start" end
-    end
-
-    attachRemote = function(remote)
-        if not active or not remote:IsA("RemoteEvent") then return end
-        for _, item in ipairs(eventConnections) do
-            if item.remote == remote then return end
-        end
-        local connection = remote.OnClientEvent:Connect(function(...)
-            if not active then return end
-            local arguments = table.pack(...)
-            local parts = {}
-            for i = 1, math.min(arguments.n, 8) do
-                table.insert(parts, formatArgument(arguments[i]))
-            end
-            if arguments.n > 8 then table.insert(parts, "...") end
-            table.insert(entries, {
-                time = os.date("%H:%M:%S"),
-                name = remote.Name,
-                args = #parts > 0 and table.concat(parts, " | ") or "(no arguments)",
-            })
-            while #entries > 100 do table.remove(entries, 1) end
-            renderEntries()
-        end)
-        table.insert(eventConnections, {connection = connection, remote = remote})
-    end
-
-    local function startMonitoring()
-        stopConnections()
-        local root = ReplicatedStorage:FindFirstChild("EasyScriptingRemotes")
-        if not root then
-            status.Text = "Folder missing - create EasyScriptingRemotes in ReplicatedStorage"
-            logConsole("Warning", "RemoteSpy needs ReplicatedStorage.EasyScriptingRemotes in your own test place.")
+    renderRight = function()
+        clearList(rightList)
+        local selected = remoteSpyState.selectedKey and remoteSpyState.groups[remoteSpyState.selectedKey]
+        if not selected or selected.direction ~= remoteSpyState.activeDirection then
+            detailsTitle.Text = "  Call history"
+            local empty = createLabel(rightList, "Select a Remote on the left to inspect its calls.\n\nUse the EasyScriptingRemoteSpy API from your own test scripts to record outgoing and incoming calls.", UDim2.new(1, -14, 0, 90), UDim2.fromOffset(7, 8), 10, COLORS.Muted)
+            empty.TextWrapped = true
+            empty.TextYAlignment = Enum.TextYAlignment.Top
+            empty.LayoutOrder = 1
+            empty.ZIndex = 55
             return
         end
-        active = true
-        for _, descendant in ipairs(root:GetDescendants()) do
-            if descendant:IsA("RemoteEvent") then
-                attachRemote(descendant)
+        detailsTitle.Text = "  " .. selected.name .. "  (x" .. tostring(selected.count) .. ")"
+        for index, entry in ipairs(selected.history) do
+            local lines = {
+                "#" .. tostring(entry.activation) .. "    Time: " .. entry.time,
+                "Method: " .. selected.method,
+                "Source: " .. entry.source,
+                "Arguments:",
+            }
+            if #entry.args == 0 then
+                table.insert(lines, "  (no arguments)")
+            else
+                for _, arg in ipairs(entry.args) do
+                    table.insert(lines, "  " .. tostring(arg.index) .. ". [" .. arg.valueType .. "] " .. arg.value)
+                end
             end
+            if #entry.results > 0 then
+                table.insert(lines, "Returns:")
+                for _, result in ipairs(entry.results) do
+                    table.insert(lines, "  " .. tostring(result.index) .. ". [" .. result.valueType .. "] " .. result.value)
+                end
+            end
+            local text = table.concat(lines, "\n")
+            local lineCount = 0
+            local charsPerLine = math.max(18, math.floor((rightList.AbsoluteSize.X - 34) / 6))
+            for _, line in ipairs(lines) do
+                lineCount = lineCount + math.max(1, math.ceil(#line / charsPerLine))
+            end
+            local cardHeight = math.max(102, 17 * lineCount + 22)
+            local card = make("Frame", {
+                Size = UDim2.new(1, -8, 0, cardHeight),
+                BackgroundColor3 = COLORS.Panel2,
+                BorderSizePixel = 0,
+                LayoutOrder = index,
+                ZIndex = 54,
+            }, rightList)
+            addCorner(card, 7)
+            local cardText = createLabel(card, text, UDim2.new(1, -16, 1, -12), UDim2.fromOffset(8, 6), 9, COLORS.Text, Enum.Font.Code)
+            cardText.TextWrapped = true
+            cardText.TextYAlignment = Enum.TextYAlignment.Top
+            cardText.ZIndex = 55
         end
-        folderConnection = root.DescendantAdded:Connect(function(descendant)
-            if descendant:IsA("RemoteEvent") then attachRemote(descendant) end
-        end)
-        status.Text = "Listening - " .. tostring(#eventConnections) .. " RemoteEvent(s)"
-        startButton.Text = "Stop"
+        rightList.CanvasPosition = Vector2.new(0, math.max(0, rightLayout.AbsoluteContentSize.Y - rightList.AbsoluteSize.Y))
     end
 
-    startButton.Activated:Connect(function()
-        if active then
-            stopConnections()
-            status.Text = "Stopped"
-            startButton.Text = "Start"
-        else
-            startMonitoring()
+    renderLeft = function()
+        clearList(leftList)
+        outgoingTab.BackgroundColor3 = remoteSpyState.activeDirection == "Outgoing" and COLORS.Accent or COLORS.Panel2
+        incomingTab.BackgroundColor3 = remoteSpyState.activeDirection == "Incoming" and COLORS.Accent or COLORS.Panel2
+        local query = string.lower(searchBox.Text or "")
+        local visibleGroups = {}
+        for _, key in ipairs(remoteSpyState.groupOrder) do
+            local group = remoteSpyState.groups[key]
+            if group and group.direction == remoteSpyState.activeDirection then
+                local searchable = string.lower(group.name .. " " .. group.path .. " " .. group.method)
+                if query == "" or string.find(searchable, query, 1, true) then
+                    table.insert(visibleGroups, group)
+                end
+            end
         end
+        table.sort(visibleGroups, function(a, b)
+            if a.count == b.count then return a.name:lower() < b.name:lower() end
+            return a.count > b.count
+        end)
+        for index, group in ipairs(visibleGroups) do
+            local row = make("TextButton", {
+                Size = UDim2.new(1, -4, 0, 42),
+                BackgroundColor3 = remoteSpyState.selectedKey == group.key and COLORS.PanelHover or COLORS.Panel2,
+                BorderSizePixel = 0,
+                Text = "",
+                LayoutOrder = index,
+                AutoButtonColor = true,
+                ZIndex = 54,
+            }, leftList)
+            addCorner(row, 6)
+            local badge = make("Frame", {
+                Size = UDim2.fromOffset(24, 24),
+                Position = UDim2.fromOffset(7, 9),
+                BackgroundColor3 = group.direction == "Outgoing" and Color3.fromRGB(191, 123, 66) or Color3.fromRGB(79, 143, 190),
+                BorderSizePixel = 0,
+                ZIndex = 55,
+            }, row)
+            addCorner(badge, 5)
+            local badgeLabel = createLabel(badge, group.remote:IsA("RemoteFunction") and "RF" or "RE", UDim2.fromScale(1, 1), UDim2.new(), 8, Color3.new(1, 1, 1), Enum.Font.GothamBold)
+            badgeLabel.TextXAlignment = Enum.TextXAlignment.Center
+            badgeLabel.ZIndex = 56
+            local nameLabel = createLabel(row, group.name, UDim2.new(1, -88, 0, 18), UDim2.fromOffset(38, 4), 9, COLORS.Text, Enum.Font.GothamMedium)
+            nameLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            nameLabel.ZIndex = 55
+            local methodLabel = createLabel(row, group.method, UDim2.new(1, -88, 0, 15), UDim2.fromOffset(38, 22), 8, COLORS.Muted)
+            methodLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            methodLabel.ZIndex = 55
+            local countLabel = createLabel(row, "x" .. tostring(group.count), UDim2.fromOffset(43, 28), UDim2.new(1, -48, 0, 7), 10, COLORS.Text, Enum.Font.GothamBold)
+            countLabel.TextXAlignment = Enum.TextXAlignment.Right
+            countLabel.ZIndex = 55
+            row.Activated:Connect(function()
+                remoteSpyState.selectedKey = group.key
+                renderLeft()
+                renderRight()
+            end)
+        end
+        if #visibleGroups == 0 then
+            local empty = createLabel(leftList, "No recorded calls.\n\nFor outgoing calls, use the API wrappers in your own test code. For incoming events, register with ObserveIncoming or ConnectIncoming.", UDim2.new(1, -14, 0, 112), UDim2.fromOffset(7, 8), 9, COLORS.Muted)
+            empty.TextWrapped = true
+            empty.TextYAlignment = Enum.TextYAlignment.Top
+            empty.LayoutOrder = 1
+            empty.ZIndex = 55
+        end
+    end
+
+    remoteSpyState.onChanged = function()
+        renderLeft()
+        renderRight()
+    end
+    searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+        renderLeft()
     end)
-    renderEntries()
+    remoteSpyAPI = nil
+    publishRemoteSpyAPI()
+    renderLeft()
+    renderRight()
     raiseZIndex(remoteSpyWindow, 50)
 end
 
@@ -2562,6 +3297,16 @@ end)
 screenGui.Destroying:Connect(function()
     if stopFreeCam then
         pcall(stopFreeCam)
+    end
+    if sharedEnvironment then
+        pcall(function()
+            if sharedEnvironment.EasyScriptingDex == dexAPI then
+                sharedEnvironment.EasyScriptingDex = nil
+            end
+            if remoteSpyAPI and sharedEnvironment.EasyScriptingRemoteSpy == remoteSpyAPI then
+                sharedEnvironment.EasyScriptingRemoteSpy = nil
+            end
+        end)
     end
 end)
 
