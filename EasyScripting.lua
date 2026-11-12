@@ -3408,10 +3408,46 @@ toolDexButton.Activated:Connect(function()
     toolsPanel.Visible = false
     openDex()
 end)
+
+-- Заменяем стандартный RemoteSpy на запуск Cobalt
 toolRemoteButton.Activated:Connect(function()
     toolsPanel.Visible = false
-    openRemoteSpy()
+    
+    local cobaltUrl = "https://gitlab.com/upio/cobalt/-/releases/permalink/latest/downloads/Cobalt.luau"
+    
+    task.spawn(function()
+        local success, err = pcall(function()
+            local source = game:HttpGet(cobaltUrl)
+            local func = loadstring(source)
+            if func then
+                func()
+                
+                -- Ждем, пока Cobalt создаст свои окна, и поднимаем их поверх EasyScripting
+                task.wait(1)
+                local parentGui = (gethui and gethui()) or game:GetService("CoreGui")
+                for _, gui in ipairs(parentGui:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui.Name ~= "EasyScriptingGui" then
+                        gui.DisplayOrder = 9999
+                    end
+                end
+                if LocalPlayer then
+                    for _, gui in ipairs(LocalPlayer:WaitForChild("PlayerGui"):GetChildren()) do
+                        if gui:IsA("ScreenGui") and gui.Name ~= "EasyScriptingGui" then
+                            gui.DisplayOrder = 9999
+                        end
+                    end
+                end
+            else
+                warn("[RemoteSpy] Ошибка компиляции Cobalt.")
+            end
+        end)
+        
+        if not success then
+            warn("[RemoteSpy] Ошибка загрузки: " .. tostring(err))
+        end
+    end)
 end)
+
 toolFreeCamButton.Activated:Connect(function()
     toolsPanel.Visible = false
     openFreeCam()
