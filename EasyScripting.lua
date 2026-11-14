@@ -1,4 +1,4 @@
---[[ Easy Scripting v1.5 (Dex+) — compact patched build
+--[[ Easy Scripting v1.6 (Dex+) — navigation, line numbers and hints
   * Projects/files/folders + editor + console
   * Dex Explorer: extended class order, type filters, name+class search, Locate, detailed icons
   * Floating toggle (F2 / [-] button) hides GUI while scripts/RemoteSpy/FreeCam keep running
@@ -17,8 +17,9 @@ if not LocalPlayer then warn("Easy Scripting: LocalPlayer is unavailable."); ret
 
 local ROOT_FOLDER = "EasyScripting"
 local DATA_FILE = ROOT_FOLDER .. "/projects.json"
+local HINTS_FILE = ROOT_FOLDER .. "/easyscriptinghints.json"
 local GUI_NAME = "EasyScriptingGui"
-local VERSION = "v1.5"
+local VERSION = "v1.6"
 
 local COLORS = {
     Background=Color3.fromRGB(18,20,27), Panel=Color3.fromRGB(25,28,37), Panel2=Color3.fromRGB(32,36,47),
@@ -134,7 +135,6 @@ local minimizeButton=createButton(header,"–",UDim2.fromOffset(34,30),UDim2.new
 minimizeButton.TextSize=22
 local closeButton=createButton(header,"X",UDim2.fromOffset(34,30),UDim2.new(1,-42,0,8),function() screenGui:Destroy() end,COLORS.Panel2)
 closeButton.TextSize=20
-makeDraggable(header,window)
 
 local isHidden=false
 function toggleEasyScripting()
@@ -173,23 +173,36 @@ local renderExecutePage
 local renderFileTree
 local stopFreeCam
 local expandedFolders={[""]=true}
+local lastTreeClickPath=nil
+local lastTreeClickIsFolder=nil
+local lastTreeClickTime=0
 local selectedTreePath="main.lua"
 local selectedTreeIsFolder=false
+local updatePathBar
+local renameSelectedPath
+local deleteSelectedTree
+local createNewFile
+local createNewFolder
+local openHintsLibrary
+local setTreeVisibility
 
 local function refreshEditorFileHeader(path)
-    if editorFileLabel then editorFileLabel.Text=path or "" end
-    if path then
-        local ext=getFileExtension(path)
-        if editorBox then
+    if editorFileLabel then editorFileLabel.Text=path or "Select a file" end
+    if editorBox then
+        editorBox.TextEditable=path~=nil and path~=""
+        if not path or path=="" then
+            editorBox.PlaceholderText="Select a file from the project tree..."
+        else
+            local ext=getFileExtension(path)
             if ext=="json" then editorBox.PlaceholderText='{"key": "value"}'
             elseif ext=="txt" then editorBox.PlaceholderText="Write text here..."
             elseif ext=="md" then editorBox.PlaceholderText="# Project notes"
             else editorBox.PlaceholderText="-- Start writing Luau code here..." end
         end
-        if runCheckButton then
-            if isScriptFile(path) then runCheckButton.Text=compact and "Check" or "Run Script"
-            else runCheckButton.Text=compact and "Valid." or "Validate" end
-        end
+    end
+    if path and runCheckButton then
+        if isScriptFile(path) then runCheckButton.Text="Run"
+        else runCheckButton.Text="Check" end
     end
 end
 local function getProjectFile(project,path)
@@ -333,7 +346,7 @@ local function openConsole()
         BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=5,CanvasSize=UDim2.fromOffset(0,0),ZIndex=41},consoleWindow)
     local lay=make("UIListLayout",{Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},consoleList)
     lay:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() if consoleList then consoleList.CanvasSize=UDim2.fromOffset(0,lay.AbsoluteContentSize.Y+8) end end)
-    makeDraggable(ch,consoleWindow); renderConsole()
+    renderConsole()
 end
 
 projectsPage=make("Frame",{Name="ProjectsPage",Size=UDim2.fromScale(1,1),BackgroundTransparency=1},body)
@@ -413,11 +426,14 @@ end
 local function openProject(project)
     currentProject=project
     ensureProjectStructure(project)
-    local f=getProjectFile(project,project.activeFile)
-    editorBox.Text=f and f.code or ""
+    editorBox.Text=""
+    editorBox.TextEditable=false
+    editorBox.PlaceholderText="Select a file from the project tree..."
     if editorViewport then editorViewport.CanvasPosition=Vector2.new(0,0) end
-    selectedTreePath=project.activeFile or "main.lua"; selectedTreeIsFolder=false
-    refreshEditorFileHeader(project.activeFile)
+    selectedTreePath=""
+    selectedTreeIsFolder=true
+    refreshEditorFileHeader(nil)
+    if updatePathBar then updatePathBar() end
     headerSubtitle.Text=project.name
     projectsPage.Visible=false; executePage.Visible=false; editorPage.Visible=true
     editorStatus.Text="Project opened - "..tostring(#project.files).." file(s)"; editorStatus.TextColor3=COLORS.Green
@@ -526,88 +542,154 @@ local runAutoFilesButton=createButton(executePage,"Run Auto Execute Files",UDim2
     if count==0 then logConsole("Info","No files marked Auto Execute.") end
     openConsole()
 end,COLORS.Accent); runAutoFilesButton.TextSize=11
--- Editor toolbar
-local editorToolbar=make("Frame",{Size=UDim2.new(1,-20,0,42),Position=UDim2.fromOffset(10,7),BackgroundTransparency=1},editorPage)
-local toolbarBackWidth=compact and 34 or 38
-local toolbarToolsWidth=compact and 62 or 82
-local toolbarRunWidth=compact and 76 or 112
-local toolbarSaveWidth=compact and 54 or 66
-local toolbarConsoleWidth=compact and 70 or 82
-local gap=compact and 4 or 7
-local xBack=0
-local xTools=xBack+toolbarBackWidth+gap
-local xRun=xTools+toolbarToolsWidth+gap
-local xSave=xRun+toolbarRunWidth+gap
-local xConsole=xSave+toolbarSaveWidth+gap
-createButton(editorToolbar,"Back",UDim2.fromOffset(toolbarBackWidth,32),UDim2.fromOffset(xBack,4),function()
-    if currentProject then syncEditorToFile(currentProject,editorBox.Text); saveData() end
+-- Editor navigation bar (row 1) and action bar (row 2).
+local navBar=make("Frame",{Name="EditorNavBar",Size=UDim2.new(1,-20,0,36),Position=UDim2.fromOffset(10,5),BackgroundTransparency=1},editorPage)
+local actionBar=make("Frame",{Name="EditorActionBar",Size=UDim2.new(1,-20,0,36),Position=UDim2.fromOffset(10,44),BackgroundTransparency=1},editorPage)
+
+local isTreeOpen=true
+local pathBarUpdating=false
+local pathBarOriginalText=""
+local pathBar=make("TextBox",{Name="PathBar",Size=UDim2.new(1,-222,1,0),Position=UDim2.fromOffset(88,0),
+    BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,Text="",PlaceholderText="Project / folder / file.lua",PlaceholderColor3=COLORS.Muted,
+    TextColor3=COLORS.Text,TextSize=compact and 9 or 11,Font=Enum.Font.Gotham,TextXAlignment=Enum.TextXAlignment.Left,
+    ClearTextOnFocus=false,TextTruncate=Enum.TextTruncate.AtEnd},navBar)
+addCorner(pathBar,7); addStroke(pathBar,COLORS.Border,0.5)
+local backButton=createButton(navBar,"←",UDim2.fromOffset(34,30),UDim2.fromOffset(0,3),function()
+    if currentProject and editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text); saveData() end
     if toolsPanel then toolsPanel.Visible=false end
     editorPage.Visible=false; projectsPage.Visible=true; headerSubtitle.Text="HOME"; renderProjects()
-end,COLORS.Panel2).TextSize=18
-local toolsButton=createButton(editorToolbar,"Tools",UDim2.fromOffset(toolbarToolsWidth,32),UDim2.fromOffset(xTools,4),function()
+end,COLORS.Panel2)
+backButton.TextSize=18
+local treeToggleButton=createButton(navBar,"Tree",UDim2.fromOffset(48,30),UDim2.fromOffset(38,3),function()
+    if setTreeVisibility then setTreeVisibility(not isTreeOpen) end
+end,COLORS.Panel2)
+treeToggleButton.TextSize=compact and 9 or 10
+local pathCommitButton
+local pathCancelButton
+pathCommitButton=createButton(navBar,"Commit",UDim2.fromOffset(58,30),UDim2.new(1,-120,0,3),function()
+    if selectedTreePath=="" then
+        pathBarUpdating=true
+        pathBar.Text=pathBarOriginalText
+        pathBarUpdating=false
+        pathCommitButton.Visible=false
+        pathCancelButton.Visible=false
+        return
+    end
+    if not currentProject or not renameSelectedPath then return end
+    local typedPath=trim(pathBar.Text)
+    local projectPrefix=currentProject.name.." / "
+    if string.sub(typedPath,1,#projectPrefix)==projectPrefix then
+        typedPath=string.sub(typedPath,#projectPrefix+1)
+    end
+    typedPath=typedPath:gsub("%s*/%s*","/")
+    local ok,err=renameSelectedPath(typedPath)
+    if not ok then
+        editorStatus.Text="Rename failed: "..tostring(err or "Invalid path")
+        editorStatus.TextColor3=COLORS.Red
+        logConsole("Error","Path Bar rename failed: "..tostring(err or "Invalid path"))
+    else
+        if updatePathBar then updatePathBar() end
+    end
+end,COLORS.Green)
+pathCommitButton.TextSize=compact and 8 or 10
+pathCommitButton.Visible=false
+pathCancelButton=createButton(navBar,"Cancel",UDim2.fromOffset(54,30),UDim2.new(1,-58,0,3),function()
+    pathBarUpdating=true
+    pathBar.Text=pathBarOriginalText
+    pathBarUpdating=false
+    pathCommitButton.Visible=false
+    pathCancelButton.Visible=false
+end,COLORS.Panel2)
+pathCancelButton.TextSize=compact and 8 or 10
+pathCancelButton.Visible=false
+pathBar:GetPropertyChangedSignal("Text"):Connect(function()
+    if pathBarUpdating then return end
+    local changed=pathBar.Text~=pathBarOriginalText
+    pathCommitButton.Visible=changed
+    pathCancelButton.Visible=changed
+end)
+
+local function actionButton(text,index,callback,color)
+    local button=createButton(actionBar,text,UDim2.new(1/6,-4,1,0),UDim2.new(index/6,0,0,0),callback,color or COLORS.Panel2)
+    button.TextSize=compact and 8 or 10
+    return button
+end
+local editorMenu
+local editorMenuButton=actionButton("Editor",0,function()
+    if editorMenu then editorMenu.Visible=not editorMenu.Visible end
+end,COLORS.Accent)
+actionButton("Hints",1,function()
+    if openHintsLibrary then openHintsLibrary() end
+end)
+actionButton("Tools",2,function()
     if toolsPanel then toolsPanel.Visible=not toolsPanel.Visible end
-end); toolsButton.TextSize=compact and 10 or 12
-runCheckButton=createButton(editorToolbar,compact and "Check" or "Run Script",UDim2.fromOffset(toolbarRunWidth,32),UDim2.fromOffset(xRun,4),function()
-    if not currentProject then return end
+    if editorMenu then editorMenu.Visible=false end
+end)
+runCheckButton=actionButton("Run",3,function()
+    if not currentProject or not editorBox.TextEditable then
+        logConsole("Warning","Open a file before running a check.")
+        openConsole()
+        return
+    end
     syncEditorToFile(currentProject,editorBox.Text)
-    local ap=currentProject.activeFile or "main.lua"
-    local af=getProjectFile(currentProject,ap)
-    local ok,msg,line=validateProjectFile(af,editorBox.Text)
+    local activePath=currentProject.activeFile or "main.lua"
+    local activeFile=getProjectFile(currentProject,activePath)
+    local ok,msg,line=validateProjectFile(activeFile,editorBox.Text)
     if ok then
-        logConsole("Success",ap..": "..msg)
-        editorStatus.Text=isScriptFile(ap) and "Syntax check passed - not executed" or msg
+        logConsole("Success",activePath..": "..msg)
+        editorStatus.Text=isScriptFile(activePath) and "Syntax check passed - not executed" or msg
         editorStatus.TextColor3=COLORS.Green
     else
-        logConsole("Error",ap..": "..msg,line)
+        logConsole("Error",activePath..": "..msg,line)
         editorStatus.Text=line and ("Syntax error on line "..tostring(line)) or "Syntax check failed"
         editorStatus.TextColor3=COLORS.Red
     end
     openConsole()
-end,COLORS.Panel2); runCheckButton.TextSize=compact and 10 or 12
-createButton(editorToolbar,"Save",UDim2.fromOffset(toolbarSaveWidth,32),UDim2.fromOffset(xSave,4),function()
+end)
+actionButton("Save",4,function()
     if not currentProject then return end
-    syncEditorToFile(currentProject,editorBox.Text)
-    local s,msg=saveData()
-    if s then
-        editorStatus.Text="Saved - "..getProjectSize(currentProject); editorStatus.TextColor3=COLORS.Green
-        logConsole("Success","Saved "..currentProject.name.."/"..currentProject.activeFile)
+    if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
+    local saved,message=saveData()
+    if saved then
+        editorStatus.Text="Saved - "..getProjectSize(currentProject)
+        editorStatus.TextColor3=COLORS.Green
+        logConsole("Success","Saved "..currentProject.name.."/"..tostring(currentProject.activeFile or ""))
     else
-        editorStatus.Text="Session copy updated"; editorStatus.TextColor3=COLORS.Yellow
-        logConsole("Warning",msg)
+        editorStatus.Text="Session copy updated"
+        editorStatus.TextColor3=COLORS.Yellow
+        logConsole("Warning",message)
     end
-end,COLORS.Panel2).TextSize=compact and 10 or 12
-createButton(editorToolbar,"Console",UDim2.fromOffset(toolbarConsoleWidth,32),UDim2.fromOffset(xConsole,4),openConsole,COLORS.Panel2).TextSize=compact and 10 or 12
+end)
+actionButton("Console",5,openConsole)
 
-local editorSurface=make("Frame",{Position=UDim2.fromOffset(10,56),Size=UDim2.new(1,-20,1,-91),BackgroundColor3=COLORS.Panel,BorderSizePixel=0},editorPage)
+local editorSurface=make("Frame",{Position=UDim2.fromOffset(10,84),Size=UDim2.new(1,-20,1,-119),BackgroundColor3=COLORS.Panel,BorderSizePixel=0},editorPage)
 addCorner(editorSurface,8); addStroke(editorSurface,COLORS.Border,0.5)
 local treePanelWidth=compact and 106 or 164
 local treePanel=make("Frame",{Name="ProjectFileTree",Position=UDim2.fromOffset(7,7),Size=UDim2.new(0,treePanelWidth,1,-14),BackgroundColor3=COLORS.Panel2,BorderSizePixel=0},editorSurface)
 addCorner(treePanel,7)
 createLabel(treePanel,"FILES",UDim2.new(1,-10,0,20),UDim2.fromOffset(6,4),9,COLORS.Muted,Enum.Font.GothamBold)
-local actionScrollHeight=compact and 82 or 108
-local fileActionsScroll=make("ScrollingFrame",{Name="FileActionsScroll",Position=UDim2.fromOffset(4,27),Size=UDim2.new(1,-8,0,actionScrollHeight),
-    BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,CanvasSize=UDim2.fromOffset(0,0),ScrollingDirection=Enum.ScrollingDirection.Y},treePanel)
-local fileActionsLayout=make("UIListLayout",{Padding=UDim.new(0,3),SortOrder=Enum.SortOrder.LayoutOrder},fileActionsScroll)
-fileActionsLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() fileActionsScroll.CanvasSize=UDim2.fromOffset(0,fileActionsLayout.AbsoluteContentSize.Y+4) end)
-local newFileButton=createButton(fileActionsScroll,"+ File",UDim2.new(1,-4,0,24),UDim2.new(),nil,COLORS.PanelHover); newFileButton.TextSize=9; newFileButton.LayoutOrder=1
-local newFolderButton=createButton(fileActionsScroll,"+ Folder",UDim2.new(1,-4,0,24),UDim2.new(),nil,COLORS.PanelHover); newFolderButton.TextSize=9; newFolderButton.LayoutOrder=2
-local renameTreeButton=createButton(fileActionsScroll,"Rename",UDim2.new(1,-4,0,24),UDim2.new(),nil,COLORS.PanelHover); renameTreeButton.TextSize=9; renameTreeButton.LayoutOrder=3
-local deleteTreeButton=createButton(fileActionsScroll,"Delete",UDim2.new(1,-4,0,24),UDim2.new(),nil,Color3.fromRGB(105,47,57)); deleteTreeButton.TextSize=9; deleteTreeButton.LayoutOrder=4
-local treeListTop=27+actionScrollHeight+5
+local treeListTop=27
 local treeList=make("ScrollingFrame",{Name="FileTreeList",Position=UDim2.fromOffset(4,treeListTop),Size=UDim2.new(1,-8,1,-(treeListTop+4)),
     BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,CanvasSize=UDim2.fromOffset(0,0)},treePanel)
 local fileTreeLayout=make("UIListLayout",{Padding=UDim.new(0,2),SortOrder=Enum.SortOrder.LayoutOrder},treeList)
 fileTreeLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() treeList.CanvasSize=UDim2.fromOffset(0,fileTreeLayout.AbsoluteContentSize.Y+6) end)
 local codePanel=make("Frame",{Name="CodePanel",Position=UDim2.fromOffset(treePanelWidth+14,0),Size=UDim2.new(1,-(treePanelWidth+21),1,0),BackgroundTransparency=1},editorSurface)
-editorFileLabel=createLabel(codePanel,"main.lua",UDim2.new(1,-58,0,25),UDim2.fromOffset(3,5),10,COLORS.Muted,Enum.Font.GothamBold)
+editorFileLabel=createLabel(codePanel,"Select a file",UDim2.new(1,-58,0,25),UDim2.fromOffset(3,5),10,COLORS.Muted,Enum.Font.GothamBold)
 local newlineButton=createButton(codePanel,"Enter",UDim2.fromOffset(48,24),UDim2.new(1,-51,0,5),nil,COLORS.Panel2); newlineButton.TextSize=10
-editorViewport=make("ScrollingFrame",{Name="CodeViewport",Position=UDim2.fromOffset(3,32),Size=UDim2.new(1,-6,1,-38),BackgroundColor3=COLORS.Panel,
+local gutterWidth=34
+local gutterBg=make("Frame",{Name="LineNumberGutter",Position=UDim2.fromOffset(3,32),Size=UDim2.new(0,gutterWidth,1,-38),
+    BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,ClipsDescendants=true},codePanel)
+addCorner(gutterBg,6)
+local gutterLabel=make("TextLabel",{Name="LineNumbers",Position=UDim2.fromOffset(0,6),Size=UDim2.fromOffset(gutterWidth,220),
+    BackgroundTransparency=1,BorderSizePixel=0,Text="1",TextColor3=COLORS.Muted,TextSize=compact and 11 or 13,
+    Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Right,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false},gutterBg)
+editorViewport=make("ScrollingFrame",{Name="CodeViewport",Position=UDim2.fromOffset(gutterWidth+3,32),Size=UDim2.new(1,-(gutterWidth+6),1,-38),BackgroundColor3=COLORS.Panel,
     BorderSizePixel=0,ClipsDescendants=true,ScrollBarThickness=compact and 5 or 7,ScrollBarImageColor3=COLORS.Muted,
     ScrollingDirection=Enum.ScrollingDirection.XY,CanvasSize=UDim2.fromOffset(0,0),Active=true},codePanel)
 addCorner(editorViewport,6)
 editorBox=make("TextBox",{Name="CodeEditor",Position=UDim2.fromOffset(8,6),Size=UDim2.fromOffset(320,220),BackgroundTransparency=1,BorderSizePixel=0,
     Text="",PlaceholderText="-- Start writing Luau code here...",PlaceholderColor3=COLORS.Muted,TextColor3=COLORS.Text,
-    TextSize=compact and 11 or 13,Font=Enum.Font.Code,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+    TextSize=compact and 11 or 13,Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
     TextWrapped=false,MultiLine=true,ClearTextOnFocus=false,Active=true},editorViewport)
 editorStatus=createLabel(editorPage,"Ready",UDim2.new(1,-24,0,22),UDim2.new(0,12,1,-27),10,COLORS.Muted)
 
@@ -630,9 +712,19 @@ local function measureEditorCanvas()
     local wb=TextService:GetTextSize(longest~="" and longest or " ",ts,font,Vector2.new(100000,100000))
     local lb=TextService:GetTextSize("Ag",ts,font,Vector2.new(100000,100000))
     local ew=math.max(vis.X-16,math.ceil(wb.X+28))
-    local eh=math.max(vis.Y-12,math.ceil(lc*lb.Y+18))
+    local tb=editorBox.TextBounds
+    local eh
+    if tb and tb.Y>0 and tb.Y>lb.Y then
+        eh=math.max(vis.Y-12,math.ceil(tb.Y+22))
+    else
+        eh=math.max(vis.Y-12,math.ceil(lc*lb.Y*1.3+28))
+    end
     editorBox.Size=UDim2.fromOffset(ew,eh)
     editorViewport.CanvasSize=UDim2.fromOffset(ew+16,eh+12)
+    local nums={}
+    for i=1,lc do nums[i]=tostring(i) end
+    gutterLabel.Text=table.concat(nums,"\n")
+    gutterLabel.Size=UDim2.fromOffset(gutterWidth,eh)
 end
 local function keepEditorCaretVisible()
     if not editorBox or not editorViewport or not editorBox.Parent then return end
@@ -645,16 +737,25 @@ local function keepEditorCaretVisible()
     local lp=string.sub(bc,lastB+1)
     local pb=TextService:GetTextSize(lp~="" and lp or " ",editorBox.TextSize,editorBox.Font,Vector2.new(100000,100000))
     local lb=TextService:GetTextSize("Ag",editorBox.TextSize,editorBox.Font,Vector2.new(100000,100000))
-    local lh=math.max(1,lb.Y); local cx=8+(lp=="" and 0 or pb.X); local cy=6+(ln-1)*lh
+    local lh=math.max(1,lb.Y*1.3); local cx=8+(lp=="" and 0 or pb.X); local cy=6+(ln-1)*lh
     local view=editorViewport.AbsoluteSize; local current=editorViewport.CanvasPosition
     local margin=16; local nx=current.X; local ny=current.Y; local cw=7
     if cx<current.X+margin then nx=math.max(0,cx-margin) elseif cx+cw>current.X+view.X-margin then nx=cx+cw-view.X+margin end
     if cy<current.Y+margin then ny=math.max(0,cy-margin) elseif cy+lh>current.Y+view.Y-margin then ny=cy+lh-view.Y+margin end
     editorViewport.CanvasPosition=Vector2.new(math.max(0,nx),math.max(0,ny))
 end
+local function remeasureEditorAfterTextChange()
+    task.defer(measureEditorCanvas)
+    task.delay(0.04,measureEditorCanvas)
+    task.delay(0.12,measureEditorCanvas)
+end
+editorViewport:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    gutterLabel.Position=UDim2.fromOffset(0,6-editorViewport.CanvasPosition.Y)
+end)
 editorBox:GetPropertyChangedSignal("Text"):Connect(function()
-    if currentProject then syncEditorToFile(currentProject,editorBox.Text) end
-    measureEditorCanvas(); task.defer(keepEditorCaretVisible)
+    if currentProject and editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
+    remeasureEditorAfterTextChange()
+    task.defer(keepEditorCaretVisible)
 end)
 UserInputService.InputBegan:Connect(function(input)
     if not editorBox or not editorBox:IsFocused() then return end
@@ -716,189 +817,371 @@ local function buildTreeMap(project)
 end
 renderFileTree=function()
     if not currentProject then return end
-    for _,c in ipairs(treeList:GetChildren()) do if c:IsA("GuiObject") then c:Destroy() end end
+    for _,child in ipairs(treeList:GetChildren()) do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
     local children=buildTreeMap(currentProject)
     local order=0
     local function addRows(parent,depth)
         for _,entry in ipairs(children[parent] or {}) do
             order=order+1
             local selected=selectedTreePath==entry.path and selectedTreeIsFolder==entry.isFolder
-            local prefix
-            if entry.isFolder then prefix=expandedFolders[entry.path]==false and "DIR+ " or "DIR- "
-            else prefix="FILE " end
-            local rowText=string.rep("  ",math.min(depth,4))..prefix..entry.name
             local row=make("TextButton",{Name=entry.isFolder and "FolderRow" or "FileRow",Size=UDim2.new(1,-3,0,24),
-                BackgroundColor3=selected and COLORS.PanelHover or COLORS.Panel2,BorderSizePixel=0,Text=rowText,
+                BackgroundColor3=selected and COLORS.PanelHover or COLORS.Panel2,BorderSizePixel=0,Text="",
                 TextColor3=selected and COLORS.Accent or COLORS.Text,TextSize=9,
                 Font=entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code,TextXAlignment=Enum.TextXAlignment.Left,
                 AutoButtonColor=true,LayoutOrder=order},treeList)
             addCorner(row,4)
+            local iconText
+            if entry.isFolder then
+                iconText=expandedFolders[entry.path]==false and "📁" or "📂"
+            else
+                local extension=getFileExtension(entry.path)
+                if extension=="lua" or extension=="luau" then iconText="📄"
+                elseif extension=="json" then iconText="📋"
+                elseif extension=="txt" then iconText="📃"
+                elseif extension=="md" then iconText="📝"
+                else iconText="📄" end
+            end
+            local entryLabel=createLabel(row,iconText.."  "..entry.name,UDim2.new(1,-(depth*14+12),1,0),
+                UDim2.fromOffset(depth*14+6,0),9,selected and COLORS.Accent or COLORS.Text,
+                entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code)
+            entryLabel.TextTruncate=Enum.TextTruncate.AtEnd
             row.Activated:Connect(function()
-                selectedTreePath=entry.path; selectedTreeIsFolder=entry.isFolder
-                if entry.isFolder then expandedFolders[entry.path]=expandedFolders[entry.path]==false
-                else
-                    syncEditorToFile(currentProject,editorBox.Text)
-                    currentProject.activeFile=entry.path
-                    editorBox.Text=entry.file.code or ""
-                    refreshEditorFileHeader(entry.path)
-                    editorViewport.CanvasPosition=Vector2.new(0,0)
-                    currentProject.updated=os.time(); saveData()
+                local now=os.clock()
+                local doubleClick=lastTreeClickPath==entry.path
+                    and lastTreeClickIsFolder==entry.isFolder
+                    and now-lastTreeClickTime<=0.38
+                lastTreeClickPath=entry.path
+                lastTreeClickIsFolder=entry.isFolder
+                lastTreeClickTime=now
+                selectedTreePath=entry.path
+                selectedTreeIsFolder=entry.isFolder
+                if updatePathBar then updatePathBar() end
+                if doubleClick then
+                    if entry.isFolder then
+                        expandedFolders[entry.path]=expandedFolders[entry.path]==false
+                    else
+                        if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
+                        currentProject.activeFile=entry.path
+                        editorBox.TextEditable=true
+                        editorBox.Text=entry.file.code or ""
+                        refreshEditorFileHeader(entry.path)
+                        editorViewport.CanvasPosition=Vector2.new(0,0)
+                        currentProject.updated=os.time()
+                        saveData()
+                    end
                 end
                 renderFileTree()
             end)
-            if entry.isFolder and expandedFolders[entry.path]~=false then addRows(entry.path,depth+1) end
+            if entry.isFolder and expandedFolders[entry.path]~=false then
+                addRows(entry.path,depth+1)
+            end
         end
     end
     addRows("",0)
 end
+
 local function showPathPopup(title,initialText,confirmText,onConfirm)
-    showTextPopup(title,initialText or "",confirmText or "Create",function(value) return onConfirm(value) end)
+    showTextPopup(title,initialText or "",confirmText or "Create",function(value)
+        return onConfirm(value)
+    end)
 end
-local function currentCreationBase() if selectedTreeIsFolder then return selectedTreePath end; return parentPath(selectedTreePath) end
-local function appendToBase(base,name) if base=="" then return name end; return base.."/"..name end
-newFileButton.Activated:Connect(function()
+local function currentCreationBase()
+    if selectedTreePath=="" then return "" end
+    if selectedTreeIsFolder then return selectedTreePath end
+    return parentPath(selectedTreePath)
+end
+local function appendToBase(base,name)
+    if base=="" then return name end
+    return base.."/"..name
+end
+
+local function showConfirmPopup(parent,titleText,message,onConfirm)
+    local targetParent=parent or window
+    local overlay=make("Frame",{Name="ConfirmOverlay",Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(0,0,0),
+        BackgroundTransparency=0.38,BorderSizePixel=0,ZIndex=100},targetParent)
+    local popupWidth=math.min(360,math.max(260,(targetParent.AbsoluteSize.X or 360)-24))
+    local popupHeight=154
+    local popup=make("Frame",{Size=UDim2.fromOffset(popupWidth,popupHeight),
+        Position=UDim2.new(0.5,-popupWidth/2,0.5,-popupHeight/2),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,ZIndex=101},overlay)
+    addCorner(popup,10)
+    addStroke(popup,COLORS.Border)
+    local title=createLabel(popup,titleText,UDim2.new(1,-24,0,26),UDim2.fromOffset(12,8),14,COLORS.Text,Enum.Font.GothamBold)
+    title.ZIndex=102
+    local messageLabel=createLabel(popup,message,UDim2.new(1,-24,0,48),UDim2.fromOffset(12,39),11,COLORS.Muted)
+    messageLabel.TextWrapped=true
+    messageLabel.TextYAlignment=Enum.TextYAlignment.Top
+    messageLabel.ZIndex=102
+    local cancel=createButton(popup,"Cancel",UDim2.fromOffset(86,30),UDim2.new(1,-184,1,-40),function()
+        overlay:Destroy()
+    end,COLORS.Panel2)
+    cancel.ZIndex=102
+    local confirm=createButton(popup,"Delete",UDim2.fromOffset(86,30),UDim2.new(1,-92,1,-40),function()
+        overlay:Destroy()
+        if onConfirm then onConfirm() end
+    end,Color3.fromRGB(105,47,57))
+    confirm.ZIndex=102
+    return overlay
+end
+
+createNewFile=function()
     if not currentProject then return end
     local initial=appendToBase(currentCreationBase(),"new.lua")
     showPathPopup("Add file",initial,"Create",function(value)
-        local path=normalizePath(value); if not path then return false,"Invalid file path." end
+        local path=normalizePath(value)
+        if not path then return false,"Invalid file path." end
         if not path:match("%.[%w_%-]+$") then path=path..".lua" end
         if not isSupportedFile(path) then return false,"Supported: .lua/.luau/.json/.txt/.md" end
         if pathTaken(currentProject,path) then return false,"Path exists." end
-        syncEditorToFile(currentProject,editorBox.Text)
+        if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
         ensureParentFolders(currentProject,path)
-        table.insert(currentProject.files,{path=path,code="",autoExecute=false})
-        currentProject.activeFile=path; editorBox.Text=""; refreshEditorFileHeader(path)
+        local newFile={path=path,code="",autoExecute=false}
+        table.insert(currentProject.files,newFile)
+        currentProject.activeFile=path
+        editorBox.TextEditable=true
+        editorBox.Text=""
+        refreshEditorFileHeader(path)
         editorViewport.CanvasPosition=Vector2.new(0,0)
-        selectedTreePath=path; selectedTreeIsFolder=false; currentProject.updated=os.time()
-        saveData(); renderFileTree()
+        selectedTreePath=path
+        selectedTreeIsFolder=false
+        currentProject.updated=os.time()
+        saveData()
+        renderFileTree()
+        if updatePathBar then updatePathBar() end
         if renderProjects then renderProjects() end
         if renderExecutePage then renderExecutePage() end
         return true
     end)
-end)
-newFolderButton.Activated:Connect(function()
+end
+
+createNewFolder=function()
     if not currentProject then return end
     local initial=appendToBase(currentCreationBase(),"NewFolder")
     showPathPopup("Add folder",initial,"Create",function(value)
-        local path=normalizePath(value); if not path then return false,"Invalid folder path." end
+        local path=normalizePath(value)
+        if not path then return false,"Invalid folder path." end
         if pathTaken(currentProject,path) then return false,"Path exists." end
-        syncEditorToFile(currentProject,editorBox.Text)
+        if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
         ensureParentFolders(currentProject,path)
         table.insert(currentProject.folders,path)
-        selectedTreePath=path; selectedTreeIsFolder=true; expandedFolders[path]=true
-        currentProject.updated=os.time(); saveData(); renderFileTree()
+        selectedTreePath=path
+        selectedTreeIsFolder=true
+        expandedFolders[path]=true
+        currentProject.updated=os.time()
+        saveData()
+        renderFileTree()
+        if updatePathBar then updatePathBar() end
         if renderProjects then renderProjects() end
         return true
     end)
-end)
-renameTreeButton.Activated:Connect(function()
-    if not currentProject then return end
-    if not selectedTreePath or selectedTreePath=="" then logConsole("Warning","Select file/folder to rename."); openConsole(); return end
-    syncEditorToFile(currentProject,editorBox.Text)
-    local oldPath=selectedTreePath; local isFolder=selectedTreeIsFolder
-    showPathPopup(isFolder and "Rename folder" or "Rename file",oldPath,"Rename",function(value)
-        local newPath=normalizePath(value); if not newPath then return false,"Invalid path." end
-        if newPath==oldPath then return true end
-        if isFolder then
-            local oldPrefix=oldPath.."/"
-            if string.sub(newPath,1,#oldPrefix)==oldPrefix then return false,"Cannot move inside itself." end
-            if pathTaken(currentProject,newPath,nil,oldPath) then return false,"Path exists." end
-            local mappedFiles={}
-            for _,file in ipairs(currentProject.files) do
-                local inside=file.path==oldPath or string.sub(file.path,1,#oldPrefix)==oldPrefix
-                if inside then
-                    local suffix=file.path==oldPath and "" or string.sub(file.path,#oldPath+2)
-                    local mapped=suffix=="" and newPath or (newPath.."/"..suffix)
-                    if not isSupportedFile(mapped) then return false,"Folder contains unsupported: "..mapped end
-                    if mappedFiles[mapped] then return false,"Duplicate path." end
-                    mappedFiles[mapped]=true
-                end
+end
+
+renameSelectedPath=function(requestedPath)
+    if not currentProject then return false,"No project is open." end
+    if selectedTreePath=="" then return true end
+    local oldPath=selectedTreePath
+    local isFolder=selectedTreeIsFolder
+    local newPath=normalizePath(requestedPath)
+    if not newPath then return false,"Invalid path." end
+    if newPath==oldPath then return true end
+    if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
+
+    if isFolder then
+        local oldPrefix=oldPath.."/"
+        if string.sub(newPath,1,#oldPrefix)==oldPrefix then return false,"Cannot move inside itself." end
+        if pathTaken(currentProject,newPath,nil,oldPath) then return false,"Path exists." end
+        local mappedFiles={}
+        for _,file in ipairs(currentProject.files) do
+            local inside=file.path==oldPath or string.sub(file.path,1,#oldPrefix)==oldPrefix
+            if inside then
+                local suffix=file.path==oldPath and "" or string.sub(file.path,#oldPath+2)
+                local mapped=suffix=="" and newPath or (newPath.."/"..suffix)
+                if not isSupportedFile(mapped) then return false,"Folder contains unsupported: "..mapped end
+                if mappedFiles[mapped] then return false,"Duplicate path." end
+                mappedFiles[mapped]=true
             end
-            for _,file in ipairs(currentProject.files) do
-                local inside=file.path==oldPath or string.sub(file.path,1,#oldPrefix)==oldPrefix
-                if not inside and mappedFiles[file.path] then return false,"Overwrites existing file." end
-            end
-            for _,folder in ipairs(currentProject.folders) do
-                local inside=folder==oldPath or string.sub(folder,1,#oldPrefix)==oldPrefix
-                if not inside and (folder==newPath or string.sub(folder,1,#newPath+1)==newPath.."/") then return false,"Overlaps folder." end
-            end
-            local activePath=currentProject.activeFile
-            if activePath==oldPath then currentProject.activeFile=newPath
-            elseif string.sub(activePath or "",1,#oldPrefix)==oldPrefix then currentProject.activeFile=newPath..string.sub(activePath,#oldPath+1) end
-            for _,file in ipairs(currentProject.files) do
-                if file.path==oldPath then file.path=newPath
-                elseif string.sub(file.path,1,#oldPrefix)==oldPrefix then file.path=newPath..string.sub(file.path,#oldPath+1) end
-            end
-            if currentProject.activeFile then refreshEditorFileHeader(currentProject.activeFile) end
-            for i,folder in ipairs(currentProject.folders) do
-                if folder==oldPath then currentProject.folders[i]=newPath
-                elseif string.sub(folder,1,#oldPrefix)==oldPrefix then currentProject.folders[i]=newPath..string.sub(folder,#oldPath+1) end
-            end
-            local movedExpanded={}
-            for path,expanded in pairs(expandedFolders) do
-                if path==oldPath then movedExpanded[newPath]=expanded
-                elseif string.sub(path,1,#oldPrefix)==oldPrefix then movedExpanded[newPath..string.sub(path,#oldPath+1)]=expanded
-                else movedExpanded[path]=expanded end
-            end
-            expandedFolders=movedExpanded
-            ensureParentFolders(currentProject,newPath)
-        else
-            local oldExt=getFileExtension(oldPath)
-            if not newPath:match("%.[%w_%-]+$") then newPath=newPath.."."..oldExt end
-            if not isSupportedFile(newPath) then return false,"Supported: .lua/.luau/.json/.txt/.md" end
-            if pathTaken(currentProject,newPath,oldPath) then return false,"Path exists." end
-            local file=getProjectFile(currentProject,oldPath); if not file then return false,"File gone." end
-            file.path=newPath
-            if not isScriptFile(newPath) then file.autoExecute=false end
-            if currentProject.activeFile==oldPath then currentProject.activeFile=newPath; refreshEditorFileHeader(newPath) end
-            ensureParentFolders(currentProject,newPath)
         end
-        selectedTreePath=newPath; currentProject.updated=os.time(); saveData(); renderFileTree()
-        if renderProjects then renderProjects() end
-        if renderExecutePage then renderExecutePage() end
-        logConsole("Success","Renamed "..oldPath.." to "..newPath)
-        return true
-    end)
-end)
-deleteTreeButton.Activated:Connect(function()
-    if not currentProject then return end
-    if not selectedTreePath or selectedTreePath=="" then logConsole("Warning","Select file/folder to delete."); openConsole(); return end
-    syncEditorToFile(currentProject,editorBox.Text)
+        for _,file in ipairs(currentProject.files) do
+            local inside=file.path==oldPath or string.sub(file.path,1,#oldPrefix)==oldPrefix
+            if not inside and mappedFiles[file.path] then return false,"Overwrites existing file." end
+        end
+        for _,folder in ipairs(currentProject.folders) do
+            local inside=folder==oldPath or string.sub(folder,1,#oldPrefix)==oldPrefix
+            if not inside and (folder==newPath or string.sub(folder,1,#newPath+1)==newPath.."/") then
+                return false,"Overlaps folder."
+            end
+        end
+        local activePath=currentProject.activeFile
+        if activePath==oldPath then currentProject.activeFile=newPath
+        elseif string.sub(activePath or "",1,#oldPrefix)==oldPrefix then
+            currentProject.activeFile=newPath..string.sub(activePath,#oldPath+1)
+        end
+        for _,file in ipairs(currentProject.files) do
+            if file.path==oldPath then file.path=newPath
+            elseif string.sub(file.path,1,#oldPrefix)==oldPrefix then
+                file.path=newPath..string.sub(file.path,#oldPath+1)
+            end
+        end
+        for i,folder in ipairs(currentProject.folders) do
+            if folder==oldPath then currentProject.folders[i]=newPath
+            elseif string.sub(folder,1,#oldPrefix)==oldPrefix then
+                currentProject.folders[i]=newPath..string.sub(folder,#oldPath+1)
+            end
+        end
+        local movedExpanded={}
+        for path,expanded in pairs(expandedFolders) do
+            if path==oldPath then movedExpanded[newPath]=expanded
+            elseif string.sub(path,1,#oldPrefix)==oldPrefix then
+                movedExpanded[newPath..string.sub(path,#oldPath+1)]=expanded
+            else
+                movedExpanded[path]=expanded
+            end
+        end
+        expandedFolders=movedExpanded
+        ensureParentFolders(currentProject,newPath)
+    else
+        local oldExtension=getFileExtension(oldPath)
+        if not newPath:match("%.[%w_%-]+$") then newPath=newPath.."."..oldExtension end
+        if not isSupportedFile(newPath) then return false,"Supported: .lua/.luau/.json/.txt/.md" end
+        if pathTaken(currentProject,newPath,oldPath) then return false,"Path exists." end
+        local file=getProjectFile(currentProject,oldPath)
+        if not file then return false,"File gone." end
+        file.path=newPath
+        if not isScriptFile(newPath) then file.autoExecute=false end
+        if currentProject.activeFile==oldPath then currentProject.activeFile=newPath end
+        ensureParentFolders(currentProject,newPath)
+    end
+
+    selectedTreePath=newPath
+    currentProject.updated=os.time()
+    saveData()
+    renderFileTree()
+    if updatePathBar then updatePathBar() end
+    if renderProjects then renderProjects() end
+    if renderExecutePage then renderExecutePage() end
+    if currentProject.activeFile then refreshEditorFileHeader(currentProject.activeFile) end
+    logConsole("Success","Renamed "..oldPath.." to "..newPath)
+    return true
+end
+
+deleteSelectedTree=function()
+    if not currentProject then return false,"No project is open." end
+    if not selectedTreePath or selectedTreePath=="" then return false,"Select a file or folder first." end
+    if editorBox.TextEditable then syncEditorToFile(currentProject,editorBox.Text) end
     local target=selectedTreePath
-    if selectedTreeIsFolder then
+    local deletingFolder=selectedTreeIsFolder
+    if deletingFolder then
         local prefix=target.."/"
         for i=#currentProject.files,1,-1 do
-            local p=currentProject.files[i].path
-            if p==target or string.sub(p,1,#prefix)==prefix then table.remove(currentProject.files,i) end
+            local filePath=currentProject.files[i].path
+            if filePath==target or string.sub(filePath,1,#prefix)==prefix then
+                table.remove(currentProject.files,i)
+            end
         end
         for i=#currentProject.folders,1,-1 do
-            local f=currentProject.folders[i]
-            if f==target or string.sub(f,1,#prefix)==prefix then table.remove(currentProject.folders,i) end
+            local folderPath=currentProject.folders[i]
+            if folderPath==target or string.sub(folderPath,1,#prefix)==prefix then
+                table.remove(currentProject.folders,i)
+            end
         end
         logConsole("Info","Deleted folder: "..target)
     else
-        if #currentProject.files<=1 then logConsole("Warning","Project needs at least 1 file."); openConsole(); return end
-        for i,file in ipairs(currentProject.files) do if file.path==target then table.remove(currentProject.files,i); break end end
+        if #currentProject.files<=1 then
+            logConsole("Warning","Project needs at least 1 file.")
+            return false,"Project needs at least 1 file."
+        end
+        for i,file in ipairs(currentProject.files) do
+            if file.path==target then table.remove(currentProject.files,i); break end
+        end
         logConsole("Info","Deleted file: "..target)
     end
+
     if #currentProject.files==0 then
         table.insert(currentProject.files,{path="main.lua",code="",autoExecute=false})
-        currentProject.folders={}; currentProject.activeFile="main.lua"
-    elseif selectedTreeIsFolder then
-        local af=getProjectFile(currentProject,currentProject.activeFile)
-        if not af then currentProject.activeFile=currentProject.files[1].path end
+        currentProject.folders={}
+        currentProject.activeFile="main.lua"
+    elseif deletingFolder then
+        local activeFile=getProjectFile(currentProject,currentProject.activeFile)
+        if not activeFile then currentProject.activeFile=currentProject.files[1].path end
     elseif currentProject.activeFile==target then
         currentProject.activeFile=currentProject.files[1].path
     end
-    local af=getProjectFile(currentProject,currentProject.activeFile)
-    editorBox.Text=af and af.code or ""
+
+    local activeFile=getProjectFile(currentProject,currentProject.activeFile)
+    editorBox.TextEditable=true
+    editorBox.Text=activeFile and activeFile.code or ""
     refreshEditorFileHeader(currentProject.activeFile)
     editorViewport.CanvasPosition=Vector2.new(0,0)
-    selectedTreePath=currentProject.activeFile; selectedTreeIsFolder=false
-    currentProject.updated=os.time(); saveData(); renderFileTree()
+    selectedTreePath=currentProject.activeFile
+    selectedTreeIsFolder=false
+    currentProject.updated=os.time()
+    saveData()
+    renderFileTree()
+    if updatePathBar then updatePathBar() end
     if renderProjects then renderProjects() end
     if renderExecutePage then renderExecutePage() end
-end)
+    return true
+end
+
+updatePathBar=function()
+    if not currentProject or not pathBar then return end
+    local displayText=currentProject.name
+    if selectedTreePath~="" then displayText=displayText.." / "..selectedTreePath end
+    pathBarUpdating=true
+    pathBar.Text=displayText
+    pathBarOriginalText=displayText
+    pathBarUpdating=false
+    pathCommitButton.Visible=false
+    pathCancelButton.Visible=false
+end
+
+setTreeVisibility=function(open)
+    isTreeOpen=open==true
+    treePanel.Visible=isTreeOpen
+    if isTreeOpen then
+        codePanel.Position=UDim2.fromOffset(treePanelWidth+14,0)
+        codePanel.Size=UDim2.new(1,-(treePanelWidth+21),1,0)
+    else
+        codePanel.Position=UDim2.fromOffset(7,0)
+        codePanel.Size=UDim2.new(1,-14,1,0)
+    end
+    if treeToggleButton then treeToggleButton.Text=isTreeOpen and "Tree" or "Tree +" end
+    task.defer(measureEditorCanvas)
+end
+
+editorMenu=make("Frame",{Name="EditorDropdown",Size=UDim2.fromOffset(compact and 142 or 164,126),
+    Position=UDim2.fromOffset(10,82),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,Visible=false,ZIndex=30},editorPage)
+addCorner(editorMenu,8)
+addStroke(editorMenu,COLORS.Border)
+createLabel(editorMenu,"Editor",UDim2.new(1,-16,0,22),UDim2.fromOffset(8,3),11,COLORS.Text,Enum.Font.GothamBold).ZIndex=31
+local addFileMenuButton=createButton(editorMenu,"Add File",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,28),function()
+    editorMenu.Visible=false
+    if createNewFile then createNewFile() end
+end,COLORS.Panel2)
+addFileMenuButton.ZIndex=31
+local addFolderMenuButton=createButton(editorMenu,"Add Folder",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,59),function()
+    editorMenu.Visible=false
+    if createNewFolder then createNewFolder() end
+end,COLORS.Panel2)
+addFolderMenuButton.ZIndex=31
+local deleteMenuButton=createButton(editorMenu,"Delete",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,90),function()
+    editorMenu.Visible=false
+    if not selectedTreePath or selectedTreePath=="" then
+        logConsole("Warning","Select a file or folder first.")
+        openConsole()
+        return
+    end
+    local target=selectedTreePath
+    showConfirmPopup(window,"Confirm Delete","Delete "..target.."? This cannot be undone.",function()
+        local ok,err=deleteSelectedTree()
+        if not ok and err then
+            editorStatus.Text=tostring(err)
+            editorStatus.TextColor3=COLORS.Red
+        end
+    end)
+end,Color3.fromRGB(105,47,57))
+deleteMenuButton.ZIndex=31
 
 toolsPanel=make("Frame",{Name="ToolsPanel",Size=UDim2.fromOffset(compact and 190 or 220,152),Position=UDim2.fromOffset(48,48),
     BackgroundColor3=COLORS.Panel,BorderSizePixel=0,Visible=false,ZIndex=20},editorPage)
@@ -922,9 +1205,291 @@ local function makeToolWindow(name,titleText,width,height,onClose)
     local close=createButton(bar,"X",UDim2.fromOffset(28,26),UDim2.new(1,-34,0,6),function() if onClose then onClose() else frame.Visible=false end end)
     close.TextSize=18; close.ZIndex=52
     local content=make("Frame",{Name="Content",Position=UDim2.fromOffset(8,44),Size=UDim2.new(1,-16,1,-52),BackgroundTransparency=1,ZIndex=51},frame)
-    makeDraggable(bar,frame)
     return frame,content
 end
+
+-- === HINTS LIBRARY ===
+local builtinHints={
+    {id="builtin_print",title="Print a message",code='print("Hello, world!")',isBuiltin=true},
+    {id="builtin_variables",title="Variables",code='local message = "Hello"\nlocal count = 5\nprint(message, count)',isBuiltin=true},
+    {id="builtin_functions",title="Functions",code='local function greet(name)\n    print("Hello, "..name)\nend\n\ngreet("Player")',isBuiltin=true},
+    {id="builtin_loops",title="Loops",code='for index = 1, 5 do\n    print("Item", index)\nend',isBuiltin=true},
+    {id="builtin_player",title="Get the LocalPlayer",code='local Players = game:GetService("Players")\nlocal player = Players.LocalPlayer',isBuiltin=true},
+    {id="builtin_instance",title="Create a Part",code='local part = Instance.new("Part")\npart.Name = "ExamplePart"\npart.Size = Vector3.new(4, 1, 4)\npart.Position = Vector3.new(0, 5, 0)\npart.Anchored = true\npart.Parent = workspace',isBuiltin=true},
+}
+local customHints={}
+local hintWindow=nil
+local hintList=nil
+local hintListLayout=nil
+
+local function saveHints()
+    if not fileStorageAvailable then return false,"File APIs are unavailable. Custom hints stay in this session." end
+    ensureFolder()
+    local serializable={}
+    for _,hint in ipairs(customHints) do
+        table.insert(serializable,{title=hint.title,code=hint.code})
+    end
+    local encodedOk,encoded=pcall(function()
+        return HttpService:JSONEncode(serializable)
+    end)
+    if not encodedOk then return false,"Hints encode failed: "..tostring(encoded) end
+    local writeOk,writeError=pcall(function()
+        writefile(HINTS_FILE,encoded)
+    end)
+    if not writeOk then return false,"Hints save failed: "..tostring(writeError) end
+    return true,"Hints saved."
+end
+
+local function loadHints()
+    if not fileStorageAvailable then return end
+    ensureFolder()
+    local exists=false
+    if type(isfile)=="function" then
+        local ok,result=pcall(isfile,HINTS_FILE)
+        exists=ok and result==true
+    else
+        exists=pcall(readfile,HINTS_FILE)
+    end
+    if not exists then return end
+    local readOk,raw=pcall(readfile,HINTS_FILE)
+    if not readOk then
+        warn("Easy Scripting: hints read failed: "..tostring(raw))
+        return
+    end
+    local decodeOk,decoded=pcall(function()
+        return HttpService:JSONDecode(raw)
+    end)
+    if not decodeOk or type(decoded)~="table" then
+        warn("Easy Scripting: invalid hints JSON.")
+        return
+    end
+    customHints={}
+    for _,item in ipairs(decoded) do
+        if type(item)=="table" and type(item.title)=="string" and type(item.code)=="string" then
+            table.insert(customHints,{id="custom_"..tostring(os.clock()).."_"..tostring(math.random(1000,9999)),
+                title=item.title,code=item.code,isBuiltin=false})
+        end
+    end
+end
+
+local function getAllHints()
+    local all={}
+    for _,hint in ipairs(builtinHints) do table.insert(all,hint) end
+    for _,hint in ipairs(customHints) do table.insert(all,hint) end
+    table.sort(all,function(a,b)
+        return string.lower(a.title)<string.lower(b.title)
+    end)
+    return all
+end
+
+local function findHintById(hintId)
+    for _,hint in ipairs(builtinHints) do
+        if hint.id==hintId then return hint end
+    end
+    for _,hint in ipairs(customHints) do
+        if hint.id==hintId then return hint end
+    end
+    return nil
+end
+
+local function insertHintIntoEditor(code)
+    if not currentProject or not editorBox or not editorBox.TextEditable then
+        logConsole("Warning","Open a script or text file in the editor before inserting a hint.")
+        openConsole()
+        return false
+    end
+    local source=editorBox.Text or ""
+    local cursor=editorBox.CursorPosition
+    local selection=editorBox.SelectionStart
+    if not cursor or cursor<1 then cursor=#source+1 end
+    if not selection or selection<1 then selection=cursor end
+    local first=math.clamp(math.min(cursor,selection),1,#source+1)
+    local last=math.clamp(math.max(cursor,selection),1,#source+1)
+    local prefix=first>1 and string.sub(source,1,first-1) or ""
+    local suffix=string.sub(source,last)
+    local separator=(prefix~="" and not prefix:match("\n$")) and "\n" or ""
+    local inserted=separator..code
+    if suffix~="" and not inserted:match("\n$") then inserted=inserted.."\n" end
+    editorBox.Text=prefix..inserted..suffix
+    local newCursor=#prefix+#inserted+1
+    editorBox.CursorPosition=newCursor
+    editorBox.SelectionStart=newCursor
+    editorBox:CaptureFocus()
+    return true
+end
+
+local function showHintCode(hint)
+    local overlay=make("Frame",{Name="HintCodeOverlay",Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(0,0,0),
+        BackgroundTransparency=0.38,BorderSizePixel=0,ZIndex=110},hintWindow)
+    local popupWidth=math.min(560,math.max(280,hintWindow.AbsoluteSize.X-24))
+    local popupHeight=math.min(380,math.max(260,hintWindow.AbsoluteSize.Y-24))
+    local popup=make("Frame",{Size=UDim2.fromOffset(popupWidth,popupHeight),
+        Position=UDim2.new(0.5,-popupWidth/2,0.5,-popupHeight/2),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,ZIndex=111},overlay)
+    addCorner(popup,10)
+    addStroke(popup,COLORS.Border)
+    local title=createLabel(popup,hint.title,UDim2.new(1,-24,0,28),UDim2.fromOffset(12,7),14,COLORS.Text,Enum.Font.GothamBold)
+    title.ZIndex=112
+    local codeBox=make("TextBox",{Size=UDim2.new(1,-24,1,-94),Position=UDim2.fromOffset(12,42),
+        BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,Text=hint.code,TextColor3=COLORS.Text,TextSize=compact and 10 or 12,
+        Font=Enum.Font.Code,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+        TextWrapped=false,MultiLine=true,ClearTextOnFocus=false,TextEditable=false,ZIndex=112},popup)
+    addCorner(codeBox,7)
+    local insertButton=createButton(popup,"Insert into Editor",UDim2.fromOffset(142,32),UDim2.new(1,-252,1,-42),function()
+        if insertHintIntoEditor(hint.code) then overlay:Destroy() end
+    end,COLORS.Accent)
+    insertButton.ZIndex=112
+    local closeButton=createButton(popup,"Close",UDim2.fromOffset(86,32),UDim2.new(1,-100,1,-42),function()
+        overlay:Destroy()
+    end,COLORS.Panel2)
+    closeButton.ZIndex=112
+end
+
+local function showHintEditor(hint,isNew)
+    local overlay=make("Frame",{Name="HintEditorOverlay",Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.fromRGB(0,0,0),
+        BackgroundTransparency=0.38,BorderSizePixel=0,ZIndex=120},hintWindow)
+    local popupWidth=math.min(560,math.max(280,hintWindow.AbsoluteSize.X-24))
+    local popupHeight=math.min(430,math.max(300,hintWindow.AbsoluteSize.Y-24))
+    local popup=make("Frame",{Size=UDim2.fromOffset(popupWidth,popupHeight),
+        Position=UDim2.new(0.5,-popupWidth/2,0.5,-popupHeight/2),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,ZIndex=121},overlay)
+    addCorner(popup,10)
+    addStroke(popup,COLORS.Border)
+    local title=createLabel(popup,isNew and "Add Hint" or "Edit Hint",UDim2.new(1,-24,0,28),UDim2.fromOffset(12,7),14,COLORS.Text,Enum.Font.GothamBold)
+    title.ZIndex=122
+    createLabel(popup,"Title",UDim2.new(1,-24,0,18),UDim2.fromOffset(12,40),10,COLORS.Muted).ZIndex=122
+    local titleBox=make("TextBox",{Size=UDim2.new(1,-24,0,34),Position=UDim2.fromOffset(12,59),
+        BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,Text=hint and hint.title or "",PlaceholderText="Hint title",
+        PlaceholderColor3=COLORS.Muted,TextColor3=COLORS.Text,TextSize=11,Font=Enum.Font.Gotham,
+        ClearTextOnFocus=false,ZIndex=122},popup)
+    addCorner(titleBox,6)
+    createLabel(popup,"Code",UDim2.new(1,-24,0,18),UDim2.fromOffset(12,100),10,COLORS.Muted).ZIndex=122
+    local codeBox=make("TextBox",{Size=UDim2.new(1,-24,1,-180),Position=UDim2.fromOffset(12,119),
+        BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,Text=hint and hint.code or "",PlaceholderText="Write or paste code here...",
+        PlaceholderColor3=COLORS.Muted,TextColor3=COLORS.Text,TextSize=compact and 10 or 12,Font=Enum.Font.Code,
+        TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false,
+        MultiLine=true,ClearTextOnFocus=false,ZIndex=122},popup)
+    addCorner(codeBox,6)
+    local errorLabel=createLabel(popup,"",UDim2.new(1,-24,0,16),UDim2.new(0,12,1,-58),9,COLORS.Red)
+    errorLabel.ZIndex=122
+    local cancelButton=createButton(popup,"Cancel",UDim2.fromOffset(86,30),UDim2.new(1,-184,1,-38),function()
+        overlay:Destroy()
+    end,COLORS.Panel2)
+    cancelButton.ZIndex=122
+    local saveButton=createButton(popup,"Save",UDim2.fromOffset(86,30),UDim2.new(1,-92,1,-38),function()
+        local titleText=trim(titleBox.Text)
+        if titleText=="" then errorLabel.Text="Title cannot be empty."; return end
+        if isNew then
+            table.insert(customHints,{id="custom_"..tostring(os.clock()).."_"..tostring(math.random(1000,9999)),
+                title=titleText,code=codeBox.Text,isBuiltin=false})
+        else
+            local target=findHintById(hint.id)
+            if not target then errorLabel.Text="Hint no longer exists."; return end
+            target.title=titleText
+            target.code=codeBox.Text
+        end
+        if isNew or (hint and not hint.isBuiltin) then
+            local saved,message=saveHints()
+            if not saved then logConsole("Warning",message) else logConsole("Success","Hints saved.") end
+        end
+        overlay:Destroy()
+        if hintList then
+            for _,child in ipairs(hintList:GetChildren()) do
+                if child:IsA("GuiObject") then child:Destroy() end
+            end
+            -- Rebuild the library rows after the edit.
+            local currentOpen=hintWindow.Visible
+            if currentOpen then
+                task.defer(function()
+                    if openHintsLibrary then openHintsLibrary(true) end
+                end)
+            end
+        end
+    end,COLORS.Accent)
+    saveButton.ZIndex=122
+end
+
+local function renderHintsList()
+    if not hintList then return end
+    for _,child in ipairs(hintList:GetChildren()) do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    local allHints=getAllHints()
+    for index,hint in ipairs(allHints) do
+        local row=make("Frame",{Name="HintRow_"..tostring(hint.id),Size=UDim2.new(1,-6,0,36),
+            BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,LayoutOrder=index},hintList)
+        addCorner(row,6)
+        local title=createLabel(row,hint.title,UDim2.new(1,-164,1,0),UDim2.fromOffset(8,0),10,COLORS.Text,Enum.Font.GothamMedium)
+        title.TextTruncate=Enum.TextTruncate.AtEnd
+        local openButton=createButton(row,"Open",UDim2.fromOffset(46,26),UDim2.new(1,-158,0,5),function()
+            showHintCode(hint)
+        end,COLORS.Accent)
+        openButton.TextSize=9
+        local editButton=createButton(row,"Edit",UDim2.fromOffset(44,26),UDim2.new(1,-108,0,5),function()
+            showHintEditor(hint,false)
+        end,COLORS.PanelHover)
+        editButton.TextSize=9
+        local deleteButton=createButton(row,"Delete",UDim2.fromOffset(54,26),UDim2.new(1,-60,0,5),function()
+            showConfirmPopup(hintWindow,"Delete Hint","Delete "..hint.title.."? This cannot be undone.",function()
+                if hint.isBuiltin then
+                    for hintIndex,builtin in ipairs(builtinHints) do
+                        if builtin.id==hint.id then table.remove(builtinHints,hintIndex); break end
+                    end
+                else
+                    for hintIndex,custom in ipairs(customHints) do
+                        if custom.id==hint.id then table.remove(customHints,hintIndex); break end
+                    end
+                    local saved,message=saveHints()
+                    if not saved then logConsole("Warning",message) end
+                end
+                renderHintsList()
+            end)
+        end,Color3.fromRGB(105,47,57))
+        deleteButton.TextSize=8
+    end
+    if hintListLayout then
+        hintList.CanvasSize=UDim2.fromOffset(0,hintListLayout.AbsoluteContentSize.Y+8)
+    end
+end
+
+openHintsLibrary=function(refreshOnly)
+    if hintWindow then
+        hintWindow.Visible=true
+        if refreshOnly then
+            renderHintsList()
+            return
+        end
+        renderHintsList()
+        return
+    end
+    local width=math.max(300,math.min(560,windowWidth-30))
+    local height=math.min(430,math.max(300,windowHeight-70))
+    hintWindow=make("Frame",{Name="HintsLibraryWindow",Size=UDim2.fromOffset(width,height),
+        Position=UDim2.new(0.5,-width/2,0.5,-height/2),BackgroundColor3=COLORS.Background,
+        BorderSizePixel=0,Visible=true,ZIndex=70},screenGui)
+    addCorner(hintWindow,10)
+    addStroke(hintWindow,COLORS.Border)
+    local hintHeader=make("Frame",{Size=UDim2.new(1,0,0,42),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,ZIndex=71},hintWindow)
+    addCorner(hintHeader,10)
+    local title=createLabel(hintHeader,"  Hints Library",UDim2.new(1,-170,1,0),UDim2.fromOffset(8,0),14,COLORS.Text,Enum.Font.GothamBold)
+    title.ZIndex=72
+    local addHintButton=createButton(hintHeader,"+ Add Hint",UDim2.fromOffset(94,28),UDim2.new(1,-132,0,7),function()
+        showHintEditor(nil,true)
+    end,COLORS.Accent)
+    addHintButton.TextSize=9
+    addHintButton.ZIndex=72
+    local closeButton=createButton(hintHeader,"X",UDim2.fromOffset(28,28),UDim2.new(1,-34,0,7),function()
+        hintWindow.Visible=false
+    end,COLORS.Panel2)
+    closeButton.TextSize=16
+    closeButton.ZIndex=72
+    hintList=make("ScrollingFrame",{Name="HintsList",Position=UDim2.fromOffset(10,50),Size=UDim2.new(1,-20,1,-60),
+        BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=5,CanvasSize=UDim2.fromOffset(0,0),ZIndex=71},hintWindow)
+    hintListLayout=make("UIListLayout",{Padding=UDim.new(0,5),SortOrder=Enum.SortOrder.LayoutOrder},hintList)
+    hintListLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function()
+        if hintList then hintList.CanvasSize=UDim2.fromOffset(0,hintListLayout.AbsoluteContentSize.Y+8) end
+    end)
+    renderHintsList()
+end
+
 local function objectPath(object)
     local names={}; local current=object
     while current and current~=game do table.insert(names,1,current.Name); current=current.Parent end
@@ -1510,7 +2075,7 @@ toolRemoteButton.Activated:Connect(function() toolsPanel.Visible=false; openRemo
 toolFreeCamButton.Activated:Connect(function() toolsPanel.Visible=false; openFreeCam() end)
 
 -- Init
-loadData(); renderProjects(); renderExecutePage()
+loadData(); loadHints(); renderProjects(); renderExecutePage()
 if not fileStorageAvailable then
     logConsole("Warning","readfile/writefile unavailable. Session-only projects.")
 else logConsole("Info","Project storage: "..DATA_FILE) end
