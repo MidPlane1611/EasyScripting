@@ -2640,13 +2640,8 @@ local AI_PROVIDERS = {
         keyRequired = true,
         defaultModel = "openai/gpt-oss-120b",
         cooldownSeconds = 0,
-        models = {
-            { id = "openai/gpt-oss-120b", label = "GPT-OSS 120B" },
-            { id = "openai/gpt-oss-20b", label = "GPT-OSS 20B" },
-            { id = "qwen/qwen3.8-27b", label = "Qwen 3.8 27B" },
-            { id = "meta-llama/llama-3.3-70b-versatile", label = "Llama 3.3 70B" },
-            { id = "moonshotai/kimi-k2-instruct", label = "Kimi K2" },
-        },
+        dynamicModels = true,
+        models = {},
     },
     {
         id = "nvidia",
@@ -2845,8 +2840,9 @@ openAIChat = function()
         if type(state.http) ~= "function" then return nil, "HTTP_UNAVAILABLE" end
 
         local headers = { ["Content-Type"] = "application/json" }
-        if provider.keyRequired then
-            headers["Authorization"] = "Bearer " .. aiKeys[provider.id]
+        local providerKey = aiKeys[provider.id]
+        if provider.keyRequired or (type(providerKey) == "string" and providerKey ~= "") then
+            headers["Authorization"] = "Bearer " .. providerKey
         end
         local bodyOk, body = pcall(function()
             return HttpService:JSONEncode({ model = modelId, messages = messages })
@@ -2872,6 +2868,93 @@ openAIChat = function()
         local content = data.choices[1].message.content
         if type(content) ~= "string" or trim(content) == "" then return nil, "EMPTY_CONTENT" end
         return content, nil
+    end
+
+    local GROQ_MODELS_CACHE_FILE = ROOT_FOLDER .. "/groq_models.json"
+    local groqModelsLastFetch = 0
+
+    local function loadGroqModelsCache()
+        if type(readfile) ~= "function" then return nil end
+        local ok, raw = pcall(readfile, GROQ_MODELS_CACHE_FILE)
+        if not ok or type(raw) ~= "string" or raw == "" then return nil end
+        local okDec, data = pcall(function() return HttpService:JSONDecode(raw) end)
+        if okDec and type(data) == "table" and type(data.models) == "table" then
+            return data
+        end
+        return nil
+    end
+
+    local function saveGroqModelsCache(models)
+        if type(writefile) ~= "function" then return end
+        ensureFolder()
+        local payload = { models = models, updated = os.time() }
+        local okEnc, encoded = pcall(function() return HttpService:JSONEncode(payload) end)
+        if okEnc then pcall(writefile, GROQ_MODELS_CACHE_FILE, encoded) end
+    end
+
+    local function fetchGroqModels(forceRefresh)
+        local cache = loadGroqModelsCache()
+        local now = os.time()
+        -- Keep the cache for 24 hours to avoid unnecessary API requests.
+        if not forceRefresh and cache and cache.models and (now - (tonumber(cache.updated) or 0) < 86400) then
+            return cache.models, nil
+        end
+
+        local key = aiKeys["groq"]
+        if not key or key == "" then
+            return nil, "NO_KEY"
+        end
+
+        if type(state.http) ~= "function" then
+            return nil, "HTTP_UNAVAILABLE"
+        end
+
+        local ok, response = pcall(function()
+            return state.http({
+                Url = "https://api.groq.com/openai/v1/models",
+                Method = "GET",
+                Headers = { ["Authorization"] = "Bearer " .. key },
+            })
+        end)
+
+        if not ok or type(response) ~= "table" then
+            return cache and cache.models or nil, "REQUEST_FAILED"
+        end
+
+        local st = tonumber(response.StatusCode or response.Status)
+        if st == 401 or st == 403 then
+            return cache and cache.models or nil, "UNAUTHORIZED"
+        end
+        if st and st >= 400 then
+            return cache and cache.models or nil, "HTTP_" .. tostring(st)
+        end
+        if type(response.Body) ~= "string" or response.Body == "" then
+            return cache and cache.models or nil, "EMPTY_BODY"
+        end
+
+        local pOk, data = pcall(function() return HttpService:JSONDecode(response.Body) end)
+        if not pOk or type(data) ~= "table" or type(data.data) ~= "table" then
+            return cache and cache.models or nil, "PARSE_FAILED"
+        end
+
+        local list = {}
+        for _, item in ipairs(data.data) do
+            local id = item.id
+            if type(id) == "string" then
+                -- Filter out clearly non-chat models such as Whisper, TTS and embeddings.
+                local lower = string.lower(id)
+                if not string.find(lower, "whisper", 1, true)
+                    and not string.find(lower, "tts", 1, true)
+                    and not string.find(lower, "embed", 1, true) then
+                    table.insert(list, { id = id, label = id })
+                end
+            end
+        end
+
+        table.sort(list, function(a, b) return a.id < b.id end)
+        saveGroqModelsCache(list)
+        groqModelsLastFetch = now
+        return list, nil
     end
 
     local function makeScrollingList(parent, padding)
@@ -2921,7 +3004,8 @@ openAIChat = function()
             local nameLabel = createLabel(row, selectedProvider.name, UDim2.new(1, -20, 0, 22), UDim2.fromOffset(12, 6), 13, COLORS.Text, Enum.Font.GothamBold)
             nameLabel.ZIndex = 83
             local sub = selectedProvider.keyRequired and (hasKey and "API key: saved" or "API key: missing — click Keys") or "No key required"
-            local subLabel = createLabel(row, sub .. "  •  " .. tostring(#selectedProvider.models) .. " model(s)", UDim2.new(1, -20, 0, 18), UDim2.fromOffset(12, 32), 9, hasKey and COLORS.Muted or COLORS.Yellow)
+            local modelCountText = selectedProvider.dynamicModels and "Dynamic model list" or (tostring(#selectedProvider.models) .. " model(s)")
+            local subLabel = createLabel(row, sub .. "  •  " .. modelCountText, UDim2.new(1, -20, 0, 18), UDim2.fromOffset(12, 32), 9, hasKey and COLORS.Muted or COLORS.Yellow)
             subLabel.ZIndex = 83
             row.Activated:Connect(function()
                 state.provider = selectedProvider
@@ -2941,8 +3025,28 @@ openAIChat = function()
         clearContent()
 
         local list = makeScrollingList(contentArea, 6)
+        local modelsToShow = state.provider.models
+        local errorNotice = nil
+
+        if state.provider.dynamicModels then
+            local loaded, err = fetchGroqModels(false)
+            if loaded and #loaded > 0 then
+                modelsToShow = loaded
+            else
+                -- Fall back to the provider's default model if the list cannot be loaded.
+                modelsToShow = { { id = state.provider.defaultModel, label = state.provider.defaultModel } }
+                if err then errorNotice = "Models load failed: " .. tostring(err) end
+            end
+            list.Size = UDim2.new(1, 0, 1, -38)
+        end
+
+        if errorNotice then
+            local notice = createLabel(contentArea, errorNotice, UDim2.new(1, -8, 0, 18), UDim2.fromOffset(4, -20), 9, COLORS.Yellow)
+            notice.ZIndex = 82
+        end
+
         local chats = loadAIChats()
-        for i, model in ipairs(state.provider.models) do
+        for i, model in ipairs(modelsToShow) do
             local selectedModel = model
             local key = chatKeyFor(state.provider.id, selectedModel.id)
             local selectedKey = key
@@ -2991,6 +3095,17 @@ openAIChat = function()
                 state.sessionHistories[selectedKey] = state.aiHistory
                 renderChat()
             end)
+        end
+
+        if state.provider.dynamicModels then
+            local refreshBtn = createButton(contentArea, "Refresh models", UDim2.new(1, 0, 0, 30), UDim2.new(0, 0, 1, -30), function()
+                if type(writefile) == "function" then
+                    pcall(function() writefile(GROQ_MODELS_CACHE_FILE, "") end)
+                end
+                renderModels()
+            end, COLORS.Panel2)
+            refreshBtn.ZIndex = 82
+            refreshBtn.TextSize = 10
         end
     end
 
@@ -3332,7 +3447,11 @@ openAIChat = function()
         }, frame)
         local pw = math.min(340, math.max(280, frame.AbsoluteSize.X - 24))
         local providerKeyCount = 0
-        for _, provider in ipairs(AI_PROVIDERS) do if provider.keyRequired then providerKeyCount = providerKeyCount + 1 end end
+        for _, provider in ipairs(AI_PROVIDERS) do
+            if provider.keyRequired or provider.id == "pollinations" then
+                providerKeyCount = providerKeyCount + 1
+            end
+        end
         local ph = math.max(190, 112 + providerKeyCount * 36)
         local popup = make("Frame", {
             Size = UDim2.fromOffset(pw, ph),
@@ -3349,7 +3468,8 @@ openAIChat = function()
         local y = 42
         for _, provider in ipairs(AI_PROVIDERS) do
             local selectedProvider = provider
-            if selectedProvider.keyRequired then
+            -- Show fields for required keys and for Pollinations' optional key.
+            if selectedProvider.keyRequired or selectedProvider.id == "pollinations" then
                 local providerLabel = createLabel(popup, selectedProvider.name, UDim2.fromOffset(100, 24), UDim2.fromOffset(12, y), 11, COLORS.Muted)
                 providerLabel.ZIndex = 202
                 local box = make("TextBox", {
@@ -3375,7 +3495,7 @@ openAIChat = function()
             end
         end
 
-        local note = createLabel(popup, "Pollinations works without a key", UDim2.new(1, -24, 0, 18), UDim2.fromOffset(12, y), 9, COLORS.Muted)
+        local note = createLabel(popup, "Pollinations: optional key for higher limits. Groq/NVIDIA: key required.", UDim2.new(1, -24, 0, 18), UDim2.fromOffset(12, y), 9, COLORS.Muted)
         note.ZIndex = 202
         local closeKeysButton = createButton(popup, "Close", UDim2.fromOffset(80, 30), UDim2.new(1, -92, 1, -40), function()
             overlay:Destroy()
