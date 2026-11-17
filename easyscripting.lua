@@ -3932,6 +3932,12 @@ Settings.replayStopAndSave = function()
     Replay.hookOriginal = nil
     Replay.hookMetatable = nil
     if Replay.recBar then Replay.recBar.Visible = false end
+    if Replay.autoHiddenGui then
+        Replay.autoHiddenGui = false
+        if isHidden and toggleEasyScripting then
+            toggleEasyScripting()
+        end
+    end
     if Replay.recDotPulse then Replay.recDotPulse:Cancel() end
     Replay.generating = true
     if Replay.renderUI then Replay.renderUI() end
@@ -4127,6 +4133,12 @@ Settings.replayStart = function()
         Replay.hookMetatable = mt
         Replay.hookInstalled = true
     end)
+    if not isHidden and toggleEasyScripting then
+        Replay.autoHiddenGui = true
+        toggleEasyScripting()
+    else
+        Replay.autoHiddenGui = false
+    end
 end
 local function raiseZIndex(root,value)
     if root:IsA("GuiObject") then root.ZIndex=value end
@@ -4311,7 +4323,6 @@ Settings.openReplayWindow = function()
     local h = math.max(300, math.min(420, maxH))
     local frame, content
     frame, content = makeToolWindow("ReplayWindow", "Replay", w, h, function()
-        if Replay.recording then Settings.replayStopAndSave() end
         frame.Visible = false
     end)
     Replay.window = frame
@@ -4689,8 +4700,12 @@ openAIChat = function()
     end
     local aiKeys = loadAIKeys()
     local maxW, maxH = Settings.getMaxToolSize()
-    local chatW = math.min(compact and 340 or 560, maxW)
-    local chatH = math.min(compact and 500 or 560, maxH)
+    local availableW = (editorPage and editorPage.AbsoluteSize.X > 0) and editorPage.AbsoluteSize.X or maxW
+    local availableH = (editorPage and editorPage.AbsoluteSize.Y > 0) and editorPage.AbsoluteSize.Y or maxH
+    local chatW = math.min(compact and 340 or 560, maxW, availableW - 8)
+    local chatH = math.min(compact and 500 or 560, maxH, availableH - 8)
+    chatW = math.max(240, chatW)
+    chatH = math.max(220, chatH)
     local chatWidth = UDim2.fromOffset(chatW, chatH)
     local frame = make("Frame", {
         Name = "AIChatWindow",
@@ -4750,6 +4765,12 @@ openAIChat = function()
     local sendButton, inputBox, statusLabel, messageList, listLayout
     local renderServices, renderModels, renderChat, sendAIMessage, openKeysEditor, addMessage
     local requestAI, regenerateLastResponse
+    local headerKeysButton = createButton(header, "Keys", UDim2.fromOffset(44, 28), UDim2.new(1, -82, 0, 6), function()
+        if openKeysEditor then openKeysEditor() end
+    end, COLORS.Panel2)
+    headerKeysButton.ZIndex = 82
+    headerKeysButton.TextSize = 10
+    titleLabel.Size = UDim2.new(1, -130, 1, 0)
     local function clearContent()
         for _, child in ipairs(contentArea:GetChildren()) do child:Destroy() end
         sendButton, inputBox, statusLabel, messageList, listLayout = nil, nil, nil, nil, nil
@@ -5094,9 +5115,7 @@ openAIChat = function()
         end, COLORS.Panel2)
         clearBtn.ZIndex = 82
         clearBtn.TextSize = 9
-        local keysBtn = createButton(contentArea, "Keys", UDim2.fromOffset(50, 18), UDim2.new(1, -84, 1, -64), openKeysEditor, COLORS.Panel2)
-        keysBtn.ZIndex = 82
-        keysBtn.TextSize = 9
+        -- Keys button moved to header (see headerKeysButton in openAIChat).
         local function updateCanvas()
             if not messageList or not messageList.Parent or not listLayout then return end
             messageList.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y + 16)
