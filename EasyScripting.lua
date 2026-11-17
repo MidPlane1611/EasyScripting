@@ -61,7 +61,7 @@ local Settings = {
     },
     },
     SETTINGS_FILE = ROOT_FOLDER .. "/settings.json",
-    AppSettings = { theme="Default", autoSave=false, userName="You" },
+    AppSettings = { theme="Default", autoSave=false, userName="You", deviceMode="auto" },
 }
 Settings.loadSettings = function()
     if type(readfile) ~= "function" then return end
@@ -75,6 +75,9 @@ Settings.loadSettings = function()
         Settings.AppSettings.autoSave = data.autoSave == true
         if type(data.userName) == "string" and data.userName ~= "" then
             Settings.AppSettings.userName = data.userName
+        end
+        if data.deviceMode == "auto" or data.deviceMode == "phone" or data.deviceMode == "pc" then
+            Settings.AppSettings.deviceMode = data.deviceMode
         end
     end
 end
@@ -173,9 +176,28 @@ local floatingButton=make("TextButton",{Name="EasyScriptingRestore",Size=UDim2.f
 addCorner(floatingButton,8); addStroke(floatingButton,COLORS.Border); makeDraggable(floatingButton,floatingButton)
 local viewport=workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(1280,720)
 local touchDevice=UserInputService.TouchEnabled
+Settings.isPhoneLike = false
+if Settings.AppSettings.deviceMode == "phone" then
+    Settings.isPhoneLike = true
+elseif Settings.AppSettings.deviceMode == "pc" then
+    Settings.isPhoneLike = false
+else
+    Settings.isPhoneLike = touchDevice and not UserInputService.KeyboardEnabled
+end
 local windowWidth=math.max(300,math.min(860,viewport.X-24))
 local windowHeight=math.max(340,math.min(620,viewport.Y-40))
-local compact=touchDevice or windowWidth<520
+if Settings.isPhoneLike then
+    windowWidth = math.max(280, math.min(500, viewport.X - 16))
+    windowHeight = math.max(300, math.min(480, math.floor(viewport.Y * 0.65)))
+end
+local compact
+if Settings.AppSettings.deviceMode == "phone" then
+    compact = true
+elseif Settings.AppSettings.deviceMode == "pc" then
+    compact = false
+else
+    compact = touchDevice or windowWidth < 520
+end
 local window=make("Frame",{Name="MainWindow",Size=UDim2.fromOffset(windowWidth,windowHeight),
     Position=UDim2.new(0.5,-windowWidth/2,0.5,-windowHeight/2),BackgroundColor3=COLORS.Background,BorderSizePixel=0,ClipsDescendants=true,Active=true},screenGui)
 addCorner(window,12); addStroke(window,COLORS.Border)
@@ -257,6 +279,15 @@ local function ensureFolder()
     if type(isfolder)=="function" then local ok,ex=pcall(isfolder,ROOT_FOLDER); if ok and ex then return end end
     if type(makefolder)=="function" then pcall(makefolder,ROOT_FOLDER) end
 end
+Settings.getMaxToolSize = function()
+    local vx = viewport.X
+    local vy = viewport.Y
+    if not vx or not vy or vx <= 0 or vy <= 0 then
+        vx, vy = 1280, 720
+    end
+    local margin = Settings.isPhoneLike and 8 or 20
+    return math.max(200, vx - margin * 2), math.max(200, vy - margin * 2)
+end
 local projects={}
 local currentProject=nil
 local consoleEntries={}
@@ -266,6 +297,10 @@ local consoleCountLabel=nil
 local editorBox=nil
 local editorViewport=nil
 local editorStatus=nil
+Settings.ProjectNavigation = {
+    currentViewDir = "",
+    viewingFile = false,
+}
 local BigCode = {
     mode=false,
     fullText="",
@@ -309,7 +344,6 @@ local deleteSelectedTree
 local createNewFile
 local createNewFolder
 local openAIChat
-local setTreeVisibility
 Settings.openReplayWindow=nil
 Settings.openReplayHistory=nil
 Settings.openReplayCodeViewer=nil
@@ -552,16 +586,24 @@ local function renderConsole()
         if e.kind=="Error" then col,tag=COLORS.Red,"ERROR"
         elseif e.kind=="Warning" then col,tag=COLORS.Yellow,"WARN"
         elseif e.kind=="Success" then col,tag=COLORS.Green,"OK" end
-        local rh=e.line and 58 or 44
+        local isMultiLine = (type(e.message) == "string" and (e.message:find("\n") ~= nil))
+        local rh = isMultiLine and 0 or (e.line and 58 or 44)
         local row=make("TextButton",{Name="ConsoleEntry"..tostring(i),Size=UDim2.new(1,-8,0,rh),BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,
             AutoButtonColor=e.line~=nil,Text="",LayoutOrder=i,Active=true},consoleList)
+        if isMultiLine then
+            row.AutomaticSize = Enum.AutomaticSize.Y
+        end
         addCorner(row,7)
         createLabel(row,tag,UDim2.fromOffset(54,18),UDim2.fromOffset(9,3),9,col,Enum.Font.GothamBold)
         local timeLabel = createLabel(row,e.time,UDim2.fromOffset(64,18),UDim2.new(1,-72,0,3),9,COLORS.Muted)
         if e.kind == "Error" then
             timeLabel.Position = UDim2.new(1,-134,0,3)
         end
-        local ml=createLabel(row,e.message,UDim2.new(1,-18,0,e.line and 24 or 21),UDim2.fromOffset(9,22),10,COLORS.Text)
+        local ml=createLabel(row,e.message,UDim2.new(1,-18,0,isMultiLine and 0 or (e.line and 24 or 21)),UDim2.fromOffset(9,22),10,COLORS.Text)
+        if isMultiLine then
+            ml.AutomaticSize = Enum.AutomaticSize.Y
+            make("UIPadding", { PaddingBottom = UDim.new(0, 8) }, row)
+        end
         ml.TextWrapped=true; ml.TextYAlignment=Enum.TextYAlignment.Top
         if e.line then
             createLabel(row,"Tap to jump to line "..tostring(e.line),UDim2.new(1,-18,0,14),UDim2.fromOffset(9,42),9,COLORS.Accent)
@@ -605,8 +647,9 @@ end
 logConsole=function(kind,msg,line) addConsoleEntry(kind,msg,line); renderConsole() end
 local function openConsole()
     if consoleWindow then consoleWindow.Visible=true; renderConsole(); return end
-    local w=math.max(260,math.min(520,windowWidth-24))
-    local h=math.min(340,math.max(220,windowHeight-100))
+    local maxW, maxH = Settings.getMaxToolSize()
+    local w = math.max(260, math.min(520, maxW))
+    local h = math.max(220, math.min(340, maxH - 20))
     consoleWindow=make("Frame",{Name="ConsoleWindow",Size=UDim2.fromOffset(w,h),Position=UDim2.new(0.5,-w/2,0.5,-h/2),
         BackgroundColor3=COLORS.Background,BorderSizePixel=0,ZIndex=40,Active=true},screenGui)
     Settings.registerModalWindow(consoleWindow)
@@ -680,43 +723,99 @@ Settings.showSettingsPage = function()
     for _, child in ipairs(Settings.page:GetChildren()) do
         child:Destroy()
     end
-    createLabel(Settings.page,"Theme",UDim2.new(1,-24,0,24),UDim2.fromOffset(14,20),13,COLORS.Text,Enum.Font.GothamBold)
-    local themeList = make("Frame",{
-        Size=UDim2.new(1,-24,0,44),Position=UDim2.fromOffset(12,50),BackgroundTransparency=1,
-    },Settings.page)
+
+    local settingsScroll = make("ScrollingFrame", {
+        Name = "SettingsScroll",
+        Size = UDim2.new(1, 0, 1, -50),
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 5,
+        ScrollBarImageColor3 = COLORS.Muted,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        CanvasSize = UDim2.fromOffset(0, 0),
+    }, Settings.page)
+
+    local settingsCanvas = make("Frame", {
+        Name = "SettingsCanvas",
+        Size = UDim2.new(1, 0, 0, 0),
+        AutomaticSize = Enum.AutomaticSize.Y,
+        BackgroundTransparency = 1,
+    }, settingsScroll)
+
+    make("UIPadding", {
+        PaddingTop = UDim.new(0, 12),
+        PaddingBottom = UDim.new(0, 12),
+        PaddingLeft = UDim.new(0, 14),
+        PaddingRight = UDim.new(0, 14),
+    }, settingsCanvas)
+
+    make("UIListLayout", {
+        Padding = UDim.new(0, 12),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, settingsCanvas)
+
+    local settingsCardOrder = 0
+    local function makeSettingsCard(titleText, height)
+        settingsCardOrder = settingsCardOrder + 1
+        local card = make("Frame", {
+            Size = UDim2.new(1, 0, 0, height),
+            LayoutOrder = settingsCardOrder,
+            BackgroundColor3 = COLORS.Panel,
+            BorderSizePixel = 0,
+        }, settingsCanvas)
+        addCorner(card, 8)
+        addStroke(card, COLORS.Border, 0.5)
+        createLabel(card, titleText, UDim2.new(1, -20, 0, 24), UDim2.fromOffset(10, 6), 13, COLORS.Text, Enum.Font.GothamBold)
+        return card
+    end
+
+    -- === Theme Card ===
+    local themeCard = makeSettingsCard("Theme", 80)
+    local themeList = make("Frame", {
+        Size = UDim2.new(1, -20, 0, 36),
+        Position = UDim2.fromOffset(10, 36),
+        BackgroundTransparency = 1,
+    }, themeCard)
     local themeOrder = {"Default","Midnight","Nord","Solarized","Light"}
-    local themeButtonWidth = math.floor((windowWidth - 24 - 4*6) / #themeOrder)
+    local themeButtonWidth = math.floor((windowWidth - 24 - 28 - 4*6) / #themeOrder)
     for index, themeName in ipairs(themeOrder) do
         local isActive = Settings.AppSettings.theme == themeName
-        local button = createButton(themeList,themeName,UDim2.fromOffset(themeButtonWidth,36),
-            UDim2.fromOffset((index-1)*(themeButtonWidth+6),4),function()
+        local button = createButton(themeList, themeName, UDim2.fromOffset(themeButtonWidth, 36),
+            UDim2.fromOffset((index-1)*(themeButtonWidth+6), 0), function()
                 Settings.AppSettings.theme = themeName
                 Settings.saveSettings()
                 Settings.applyThemeToAll(themeName)
                 Settings.showSettingsPage()
-            end,isActive and COLORS.Accent or COLORS.Panel2)
+            end, isActive and COLORS.Accent or COLORS.Panel2)
         button.TextSize = 10
     end
-    createLabel(Settings.page,"Auto Save",UDim2.new(1,-24,0,24),UDim2.fromOffset(14,114),13,COLORS.Text,Enum.Font.GothamBold)
-    local autoDesc = createLabel(Settings.page,
+
+    -- === Auto Save Card ===
+    local autoCard = makeSettingsCard("Auto Save", 110)
+    local autoDesc = createLabel(autoCard,
         "When enabled, the Save button becomes Auto: ON and the current file saves automatically while you type.",
-        UDim2.new(1,-28,0,36),UDim2.fromOffset(14,142),10,COLORS.Muted)
+        UDim2.new(1,-20,0,32), UDim2.fromOffset(10,30),10,COLORS.Muted)
     autoDesc.TextWrapped = true
     autoDesc.TextYAlignment = Enum.TextYAlignment.Top
-    local toggleButton = createButton(Settings.page,
+
+    local toggleButton = createButton(autoCard,
         Settings.AppSettings.autoSave and "Auto Save: ON" or "Auto Save: OFF",
-        UDim2.fromOffset(180,36),UDim2.fromOffset(14,186),function()
+        UDim2.fromOffset(180,36), UDim2.fromOffset(10,66), function()
             Settings.AppSettings.autoSave = not Settings.AppSettings.autoSave
             Settings.saveSettings()
             if Settings.updateSaveButtonVisibility then Settings.updateSaveButtonVisibility() end
             Settings.showSettingsPage()
-        end,Settings.AppSettings.autoSave and COLORS.Green or COLORS.Panel2)
+        end, Settings.AppSettings.autoSave and COLORS.Green or COLORS.Panel2)
     toggleButton.TextSize = 11
-    createLabel(Settings.page,"Your Name",UDim2.new(1,-24,0,24),UDim2.fromOffset(14,240),13,COLORS.Text,Enum.Font.GothamBold)
-    createLabel(Settings.page,"This name is displayed above your messages in AI Chat.",UDim2.new(1,-28,0,24),UDim2.fromOffset(14,264),10,COLORS.Muted)
+
+    -- === Your Name Card ===
+    local nameCard = makeSettingsCard("Your Name", 100)
+    createLabel(nameCard, "This name is displayed above your messages in AI Chat.", UDim2.new(1,-20,0,20), UDim2.fromOffset(10,30), 10, COLORS.Muted)
+
     local nameBox = make("TextBox",{
-        Size=UDim2.new(1,-28,0,36),
-        Position=UDim2.fromOffset(14,290),
+        Size=UDim2.new(1,-20,0,36),
+        Position=UDim2.fromOffset(10,56),
         BackgroundColor3=COLORS.Panel2,
         BorderSizePixel=0,
         Text=Settings.AppSettings.userName or "You",
@@ -728,8 +827,9 @@ Settings.showSettingsPage = function()
         ClearTextOnFocus=false,
         TextXAlignment=Enum.TextXAlignment.Left,
         ZIndex=54,
-    },Settings.page)
+    },nameCard)
     addCorner(nameBox,6)
+
     nameBox.FocusLost:Connect(function()
         local v = trim(nameBox.Text)
         if v == "" then v = "You" end
@@ -737,6 +837,30 @@ Settings.showSettingsPage = function()
         Settings.saveSettings()
         nameBox.Text = v
     end)
+
+    -- === Device Mode Card ===
+    local deviceCard = makeSettingsCard("Device Mode", 110)
+    local deviceNote = createLabel(deviceCard,
+        "Choose UI size. Phone mode = smaller window. Applies after script restart.",
+        UDim2.new(1,-20,0,28), UDim2.fromOffset(10,30),10,COLORS.Muted)
+    deviceNote.TextWrapped = true
+    deviceNote.TextYAlignment = Enum.TextYAlignment.Top
+
+    local deviceModes = { "auto", "phone", "pc" }
+    local deviceLabels = { auto = "Auto", phone = "Phone", pc = "PC" }
+    local deviceBtnWidth = math.floor((windowWidth - 24 - 28 - 4*6) / 3)
+    for index, mode in ipairs(deviceModes) do
+        local isActive = (Settings.AppSettings.deviceMode or "auto") == mode
+        local btn = createButton(deviceCard, deviceLabels[mode], UDim2.fromOffset(deviceBtnWidth, 36),
+            UDim2.fromOffset(10 + (index-1)*(deviceBtnWidth+6), 64), function()
+                Settings.AppSettings.deviceMode = mode
+                Settings.saveSettings()
+                Settings.showSettingsPage()
+            end, isActive and COLORS.Accent or COLORS.Panel2)
+        btn.TextSize = 11
+    end
+
+    -- Back Button (anchored to Settings.page, not the scroll)
     createButton(Settings.page,"Back",UDim2.new(1,-24,0,36),UDim2.new(0,12,1,-44),function()
         showProjectsPage()
     end,COLORS.Panel2).TextSize = 11
@@ -853,11 +977,46 @@ local function openProject(project)
     if editorViewport then editorViewport.CanvasPosition=Vector2.new(0,0) end
     selectedTreePath=""
     selectedTreeIsFolder=true
+    Settings.ProjectNavigation.currentViewDir = ""
+    Settings.ProjectNavigation.viewingFile = false
     refreshEditorFileHeader(nil)
     if updatePathBar then updatePathBar() end
     headerSubtitle.Text=project.name
     projectsPage.Visible=false; executePage.Visible=false; editorPage.Visible=true
-    editorStatus.Text="Project opened - "..tostring(#project.files).." file(s)"; editorStatus.TextColor3=COLORS.Green
+
+    -- Tree view: show only the project tree across the editor surface.
+    if Settings.ProjectNavigation.treePanel then
+        Settings.ProjectNavigation.treePanel.Visible = true
+        Settings.ProjectNavigation.treePanel.Position = UDim2.fromOffset(7, 7)
+        Settings.ProjectNavigation.treePanel.Size = UDim2.new(1, -14, 1, -14)
+    end
+    if Settings.ProjectNavigation.codePanel then
+        Settings.ProjectNavigation.codePanel.Visible = false
+        Settings.ProjectNavigation.codePanel.Position = UDim2.fromOffset(Settings.ProjectNavigation.treePanelWidth + 14, 0)
+        Settings.ProjectNavigation.codePanel.Size = UDim2.new(1, -(Settings.ProjectNavigation.treePanelWidth + 21), 1, 0)
+    end
+    if editorViewport then editorViewport.Visible = false end
+    if Settings.ProjectNavigation.gutterBg then Settings.ProjectNavigation.gutterBg.Visible = false end
+    if Settings.ProjectNavigation.newlineButton then Settings.ProjectNavigation.newlineButton.Visible = false end
+    if Settings.ProjectNavigation.pasteButton then Settings.ProjectNavigation.pasteButton.Visible = false end
+    if editorFileLabel then editorFileLabel.Visible = false end
+    if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
+    if toolsPanel then toolsPanel.Visible = false end
+    if Settings.ProjectNavigation.backButton then
+        Settings.ProjectNavigation.backButton.Text = "←"
+        Settings.ProjectNavigation.backButton.Size = UDim2.fromOffset(34, 30)
+        Settings.ProjectNavigation.backButton.TextSize = 18
+    end
+    if Settings.ProjectNavigation.treeToggleButton then
+        Settings.ProjectNavigation.treeToggleButton.Visible = true
+        Settings.ProjectNavigation.treeToggleButton.Active = false
+        Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
+        Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
+    end
+    editorBox.Visible = false
+    editorBox.TextEditable = false
+
+    editorStatus.Text="Project opened"; editorStatus.TextColor3=COLORS.Green
     consoleEntries={}
     logConsole("Info","Opened project: "..project.name)
     if renderFileTree then renderFileTree() end
@@ -1040,6 +1199,7 @@ Settings.preloadModules = function(project, entryPath, sandbox)
     local discovered, scanWarnings = Settings.discoverAllDependencies(project, entryPath)
     local failed = 0
     local loaded = 0
+    local failMessages = {}
     for _, modPath in ipairs(discovered) do
         if PM.cache[modPath] == nil then
             local ok, err = pcall(sandbox.require, "/" .. modPath)
@@ -1047,9 +1207,12 @@ Settings.preloadModules = function(project, entryPath, sandbox)
                 loaded = loaded + 1
             else
                 failed = failed + 1
-                logConsole("Warning", "Preload failed: " .. modPath .. " - " .. tostring(err))
+                table.insert(failMessages, modPath .. ": " .. tostring(err))
             end
         end
+    end
+    if #failMessages > 0 then
+        logConsole("Warning", "Preload failed for " .. tostring(#failMessages) .. " module(s):\n" .. table.concat(failMessages, "\n"))
     end
     for _, warning in ipairs(scanWarnings) do
         logConsole("Warning", "Scan: " .. warning)
@@ -1169,7 +1332,7 @@ Settings.executeBuildSandbox = function()
     }, { __index = rs })
     return sandbox
 end
-Settings.executeStopInternal = function(reason)
+Settings.executeStopInternal = function(reason, skipRestore)
     local EC = Settings.ExecuteControl
     if not EC.running and not EC.killFlag then return end
     EC.killFlag = true
@@ -1177,7 +1340,9 @@ Settings.executeStopInternal = function(reason)
         pcall(function() conn:Disconnect() end)
     end
     EC.connections = {}
-    Settings.executeRestoreState()
+    if not skipRestore then
+        Settings.executeRestoreState()
+    end
     EC.running = false
     EC.activeChunkName = nil
     if EC.stopBtn then EC.stopBtn.Visible = false end
@@ -1225,17 +1390,17 @@ local function executeProjectFile(project, file, openOutput, mode)
         EC.activeChunkName = project.name .. "/" .. file.path
         if screenGui then screenGui.Enabled = false end
         if floatingButton then floatingButton.Visible = false end
-        logConsole("Info", "Run (no sandbox): " .. project.name .. "/" .. file.path)
+        logConsole("Info", "Running project: " .. project.name)
         task.spawn(function()
             local runOk, runError = pcall(chunk)
             EC.running = false
             EC.activeChunkName = nil
             if screenGui then screenGui.Enabled = true end
             if runOk then
-                logConsole("Success", "Finished " .. project.name .. "/" .. file.path)
+                logConsole("Success", project.name .. " was successfully executed")
             else
                 local message = tostring(runError)
-                logConsole("Error", project.name .. "/" .. file.path .. ": " .. message, getLineNumber(message))
+                logConsole("Error", project.name .. " execution failed:\n" .. message, getLineNumber(message))
             end
             if renderExecutePage then renderExecutePage() end
         end)
@@ -1283,20 +1448,18 @@ local function executeProjectFile(project, file, openOutput, mode)
     if screenGui then screenGui.Enabled = false end
     if floatingButton then floatingButton.Visible = false end
     if EC.stopBtn then EC.stopBtn.Visible = true end
-    logConsole("Info", "Sandbox started: " .. project.name .. "/" .. file.path)
+    logConsole("Info", "Sandbox started: " .. project.name)
     task.spawn(function()
         local runOk, runError = pcall(chunk)
         if runOk then
-            logConsole("Success", "Finished " .. project.name .. "/" .. file.path)
+            logConsole("Success", project.name .. " was successfully executed (sandbox)")
         else
             local message = tostring(runError)
             if not message:find("Easy Scripting: execution stopped", 1, true) then
-                logConsole("Error", project.name .. "/" .. file.path .. ": " .. message, getLineNumber(message))
+                logConsole("Error", project.name .. " execution failed (sandbox):\n" .. message, getLineNumber(message))
             end
         end
-        if EC.running and not EC.killFlag then
-            Settings.executeStopInternal("finished")
-        end
+        -- Авто-стоп убран (по прошлой спеке)
     end)
     if openOutput then openConsole() end
     return true
@@ -1311,7 +1474,7 @@ renderExecutePage=function()
             order=order+1
             local row=make("Frame",{Name="ExecuteFileRow",Size=UDim2.new(1,-8,0,70),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,LayoutOrder=order},executeList)
             addCorner(row,8); addStroke(row,COLORS.Border,0.5)
-            local fl=createLabel(row,"⭐ "..project.name.." / "..mainFile.path,UDim2.new(1,-210,0,24),UDim2.fromOffset(11,7),10,COLORS.Text,Enum.Font.GothamMedium); fl.TextTruncate=Enum.TextTruncate.AtEnd
+            local fl=createLabel(row,"⭐ "..project.name,UDim2.new(1,-210,0,24),UDim2.fromOffset(11,7),10,COLORS.Text,Enum.Font.GothamMedium); fl.TextTruncate=Enum.TextTruncate.AtEnd
             createLabel(row,formatBytes(#(mainFile.code or "")),UDim2.fromOffset(100,18),UDim2.fromOffset(11,34),9,COLORS.Muted)
             local rb=createButton(row,"Run",UDim2.fromOffset(58,28),UDim2.new(1,-194,0,10),function() executeProjectFile(project,mainFile,true,"run") end,COLORS.Accent); rb.TextSize=10
             local ab=createButton(row,mainFile.autoExecute and "Auto: ON" or "Auto: OFF",UDim2.fromOffset(92,28),UDim2.new(1,-128,0,10),function()
@@ -1352,7 +1515,6 @@ end,COLORS.Accent); runAutoFilesButton.TextSize=11
 local navBar=make("Frame",{Name="EditorNavBar",Size=UDim2.new(1,-20,0,36),Position=UDim2.fromOffset(10,5),BackgroundTransparency=1},editorPage)
 local actionBar=make("ScrollingFrame",{Name="EditorActionBar",Size=UDim2.new(1,-20,0,36),Position=UDim2.fromOffset(10,44),BackgroundTransparency=1,ScrollBarThickness=4,ScrollBarImageColor3=COLORS.Muted,ScrollingDirection=Enum.ScrollingDirection.X,CanvasSize=UDim2.fromOffset(0,0),BorderSizePixel=0,Active=true},editorPage)
 Settings.actionBarContent=make("Frame",{Name="EditorActionBarContent",Size=UDim2.new(1,0,1,0),BackgroundTransparency=1},actionBar)
-local isTreeOpen=true
 local pathBarUpdating=false
 local pathBarParts={inputOriginalText=""}
 local pathBar=make("Frame",{Name="PathBar",Size=UDim2.new(1,-222,1,0),Position=UDim2.fromOffset(88,0),
@@ -1378,58 +1540,147 @@ pathBarParts.updateSize=function()
     input.Size=UDim2.new(1,-w,1,0)
 end
 pathBarParts.prefixLabel:GetPropertyChangedSignal("Text"):Connect(pathBarParts.updateSize)
-local backButton=createButton(navBar,"←",UDim2.fromOffset(34,30),UDim2.fromOffset(0,3),function()
+Settings.ProjectNavigation.backButton=createButton(navBar,"←",UDim2.fromOffset(34,30),UDim2.fromOffset(0,3),function()
+    -- The arrow always returns to the Home projects page.
     if currentProject and (BigCode.mode or editorBox.TextEditable) then
         BigCode.syncCurrentFile()
         saveData()
     end
-    if toolsPanel then toolsPanel.Visible=false end
-    editorPage.Visible=false; projectsPage.Visible=true; headerSubtitle.Text="HOME"; renderProjects()
+    if Settings.ProjectNavigation.viewingFile then
+        if BigCode.clearMode then BigCode.clearMode() end
+        Settings.ProjectNavigation.viewingFile = false
+        editorBox.TextEditable = false
+        editorBox.Visible = false
+    end
+    if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
+    if toolsPanel then toolsPanel.Visible = false end
+    if Settings.ProjectNavigation.treeToggleButton then
+        Settings.ProjectNavigation.treeToggleButton.Active = false
+        Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
+        Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
+    end
+    editorPage.Visible=false
+    projectsPage.Visible=true
+    headerSubtitle.Text="HOME"
+    renderProjects()
 end,COLORS.Panel2)
-backButton.TextSize=18
-local treeToggleButton=createButton(navBar,"Tree",UDim2.fromOffset(48,30),UDim2.fromOffset(38,3),function()
-    if setTreeVisibility then setTreeVisibility(not isTreeOpen) end
+Settings.ProjectNavigation.backButton.TextSize=18
+Settings.ProjectNavigation.treeToggleButton=createButton(navBar,"Tree",UDim2.fromOffset(48,30),UDim2.fromOffset(38,3),function()
+    local nav = Settings.ProjectNavigation
+    if not nav.viewingFile then return end
+
+    -- Save the current file, then switch from the editor to the full-screen tree.
+    if currentProject and (BigCode.mode or editorBox.TextEditable) then
+        BigCode.syncCurrentFile()
+        saveData()
+    end
+    if BigCode.clearMode then BigCode.clearMode() end
+    nav.viewingFile = false
+    editorBox.TextEditable = false
+    editorBox.Visible = false
+
+    if nav.treePanel then
+        nav.treePanel.Visible = true
+        nav.treePanel.Position = UDim2.fromOffset(7, 7)
+        nav.treePanel.Size = UDim2.new(1, -14, 1, -14)
+    end
+    if nav.codePanel then
+        nav.codePanel.Visible = false
+        nav.codePanel.Position = UDim2.fromOffset(nav.treePanelWidth + 14, 0)
+        nav.codePanel.Size = UDim2.new(1, -(nav.treePanelWidth + 21), 1, 0)
+    end
+    if editorViewport then editorViewport.Visible = false end
+    if nav.gutterBg then nav.gutterBg.Visible = false end
+    if nav.newlineButton then nav.newlineButton.Visible = false end
+    if nav.pasteButton then nav.pasteButton.Visible = false end
+    if editorFileLabel then editorFileLabel.Visible = false end
+    if nav.editorMenu then nav.editorMenu.Visible = false end
+    if toolsPanel then toolsPanel.Visible = false end
+
+    if nav.backButton then
+        nav.backButton.Text = "←"
+        nav.backButton.Size = UDim2.fromOffset(34, 30)
+        nav.backButton.TextSize = 18
+    end
+    nav.treeToggleButton.Active = false
+    nav.treeToggleButton.AutoButtonColor = false
+    nav.treeToggleButton.TextColor3 = COLORS.Muted
+    if updatePathBar then updatePathBar() end
+    if renderFileTree then renderFileTree() end
+    editorStatus.Text = "Project tree"
+    editorStatus.TextColor3 = COLORS.Muted
 end,COLORS.Panel2)
-treeToggleButton.TextSize=compact and 9 or 10
+Settings.ProjectNavigation.treeToggleButton.TextSize=compact and 9 or 10
+Settings.ProjectNavigation.treeToggleButton.Visible = true
+Settings.ProjectNavigation.treeToggleButton.Active = false
+Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
+Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
 local pathCommitButton
 local pathCancelButton
-pathCommitButton=createButton(navBar,"Commit",UDim2.fromOffset(58,30),UDim2.new(1,-120,0,3),function()
-    if selectedTreePath=="" then
-        pathBarUpdating=true
-        pathBarParts.input.Text=pathBarParts.inputOriginalText
-        pathBarUpdating=false
-        pathCommitButton.Visible=false
-        pathCancelButton.Visible=false
-        return
+pathCommitButton=createButton(navBar,"Save",UDim2.fromOffset(58,30),UDim2.new(1,-120,0,3),function()
+    -- Always save the current editor source first.
+    if currentProject then
+        local textToSave
+        if BigCode.mode then
+            textToSave = BigCode.getSource()
+            syncEditorToFile(currentProject, textToSave)
+        elseif editorBox.TextEditable then
+            textToSave = editorBox.Text
+            syncEditorToFile(currentProject, textToSave)
+        end
+        local saved, message = saveData()
+        if saved then
+            editorStatus.Text = "Saved - " .. getProjectSize(currentProject)
+            editorStatus.TextColor3 = COLORS.Green
+            logConsole("Success", "Saved " .. currentProject.name)
+        else
+            editorStatus.Text = "Session copy updated"
+            editorStatus.TextColor3 = COLORS.Yellow
+            logConsole("Warning", message)
+        end
     end
-    if not currentProject or not renameSelectedPath then return end
-    local typedSuffix=trim(pathBarParts.input.Text)
-    local prefixText=pathBarParts.prefixLabel.Text
-    local projectPrefix=currentProject.name.." / "
-    local folderPart=""
-    if string.sub(prefixText,1,#projectPrefix)==projectPrefix then
-        folderPart=string.sub(prefixText,#projectPrefix+1)
-        folderPart=folderPart:gsub("%s*/%s*$","")
+
+    -- If the path was edited, also rename the selected item.
+    if pathBarParts.input.Text ~= pathBarParts.inputOriginalText then
+        if selectedTreePath=="" then
+            pathBarUpdating=true
+            pathBarParts.input.Text=pathBarParts.inputOriginalText
+            pathBarUpdating=false
+            pathCommitButton.Text="Save"
+            pathCancelButton.Visible=false
+            return
+        end
+        if not currentProject or not renameSelectedPath then return end
+        local typedSuffix=trim(pathBarParts.input.Text)
+        local prefixText=pathBarParts.prefixLabel.Text
+        local projectPrefix=currentProject.name.." / "
+        local folderPart=""
+        if string.sub(prefixText,1,#projectPrefix)==projectPrefix then
+            folderPart=string.sub(prefixText,#projectPrefix+1)
+            folderPart=folderPart:gsub("%s*/%s*$","")
+        end
+        local typedPath=typedSuffix
+        if folderPart~="" then typedPath=folderPart.."/"..typedSuffix end
+        typedPath=typedPath:gsub("%s*/%s*","/")
+        local ok,err=renameSelectedPath(typedPath)
+        if not ok then
+            editorStatus.Text="Rename failed: "..tostring(err or "Invalid path")
+            editorStatus.TextColor3=COLORS.Red
+            logConsole("Error","Path Bar rename failed: "..tostring(err or "Invalid path"))
+        else
+            if updatePathBar then updatePathBar() end
+        end
     end
-    local typedPath=typedSuffix
-    if folderPart~="" then typedPath=folderPart.."/"..typedSuffix end
-    typedPath=typedPath:gsub("%s*/%s*","/")
-    local ok,err=renameSelectedPath(typedPath)
-    if not ok then
-        editorStatus.Text="Rename failed: "..tostring(err or "Invalid path")
-        editorStatus.TextColor3=COLORS.Red
-        logConsole("Error","Path Bar rename failed: "..tostring(err or "Invalid path"))
-    else
-        if updatePathBar then updatePathBar() end
-    end
+    pathCommitButton.Text = "Save"
+    pathCancelButton.Visible = false
 end,COLORS.Green)
 pathCommitButton.TextSize=compact and 8 or 10
-pathCommitButton.Visible=false
+pathCommitButton.Visible=true
 pathCancelButton=createButton(navBar,"Cancel",UDim2.fromOffset(54,30),UDim2.new(1,-58,0,3),function()
     pathBarUpdating=true
     pathBarParts.input.Text=pathBarParts.inputOriginalText
     pathBarUpdating=false
-    pathCommitButton.Visible=false
+    pathCommitButton.Text="Save"
     pathCancelButton.Visible=false
 end,COLORS.Panel2)
 pathCancelButton.TextSize=compact and 8 or 10
@@ -1437,8 +1688,13 @@ pathCancelButton.Visible=false
 pathBarParts.input:GetPropertyChangedSignal("Text"):Connect(function()
     if pathBarUpdating then return end
     local changed=pathBarParts.input.Text~=pathBarParts.inputOriginalText
-    pathCommitButton.Visible=changed
-    pathCancelButton.Visible=changed
+    if changed then
+        pathCommitButton.Text = "Commit"
+        pathCancelButton.Visible = true
+    else
+        pathCommitButton.Text = "Save"
+        pathCancelButton.Visible = false
+    end
 end)
 Settings.actionBarBtnWidth=88
 Settings.actionBarBtnGap=4
@@ -1470,16 +1726,23 @@ Settings.updateSaveButtonVisibility = function()
         saveActionButton.Selectable = true
     end
 end
-local editorMenu
 local editorMenuButton=actionButton("Editor",0,function()
-    if editorMenu then editorMenu.Visible=not editorMenu.Visible end
+    if not Settings.ProjectNavigation.editorMenu then return end
+    Settings.ProjectNavigation.editorMenu.Visible=not Settings.ProjectNavigation.editorMenu.Visible
+    if Settings.ProjectNavigation.editorMenu.Visible then
+        for _, btn in ipairs(Settings.ProjectNavigation.editorMenu:GetChildren()) do
+            if btn:IsA("TextButton") and btn.Text == "Create New" then
+                btn.Visible = not Settings.ProjectNavigation.viewingFile
+            end
+        end
+    end
 end,COLORS.Accent)
 actionButton("AI Chat",1,function()
     if openAIChat then openAIChat() end
 end,COLORS.Accent)
 actionButton("Tools",2,function()
     if toolsPanel then toolsPanel.Visible=not toolsPanel.Visible end
-    if editorMenu then editorMenu.Visible=false end
+    if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible=false end
 end)
 runCheckButton=actionButton("Run",3,function()
     if not currentProject or (not editorBox.TextEditable and not BigCode.mode) then
@@ -1503,71 +1766,48 @@ runCheckButton=actionButton("Run",3,function()
     end
     openConsole()
 end)
-Settings.saveActionButton=actionButton("Save",4,function()
-    if Settings.AppSettings.autoSave then
-        logConsole("Info","Auto Save is ON - use Settings to disable it first.")
+actionButton("Console",4,openConsole)
+actionButton("Replay",5,function()
+    if Settings.openReplayWindow then Settings.openReplayWindow() end
+end,COLORS.Accent)
+actionButton("Sandbox",6,function()
+    if not currentProject then
+        logConsole("Warning","Open a project first.")
+        openConsole()
         return
     end
-    if not currentProject then return end
-    local textToSave
-    if BigCode.mode then
-        textToSave=BigCode.getSource()
-        syncEditorToFile(currentProject,textToSave)
-    elseif editorBox.TextEditable then
-        textToSave=editorBox.Text
-        syncEditorToFile(currentProject,textToSave)
+    local mainFile=getProjectFile(currentProject,currentProject.mainFile)
+    if not mainFile then
+        logConsole("Warning","Main file not found in project.")
+        openConsole()
+        return
     end
-    local saved,message=saveData()
-    if saved then
-        editorStatus.Text="Saved - "..getProjectSize(currentProject)
-        editorStatus.TextColor3=COLORS.Green
-        logConsole("Success","Saved "..currentProject.name.."/"..tostring(currentProject.activeFile or ""))
-    else
-        editorStatus.Text="Session copy updated"
-        editorStatus.TextColor3=COLORS.Yellow
-        logConsole("Warning",message)
-    end
-    if BigCode.mode and textToSave then
-        if BigCode.shouldUsePreview(textToSave) then
-            local restorePosition = editorViewport.CanvasPosition
-            BigCode.render(textToSave, restorePosition)
-        else
-            BigCode.clearMode()
-            editorBox.Visible=true
-            editorBox.TextEditable=true
-            editorBox.Text=textToSave
-            task.defer(measureEditorCanvas)
-        end
-    end
-end)
-actionButton("Console",5,openConsole)
-actionButton("Replay",6,function()
-    if Settings.openReplayWindow then Settings.openReplayWindow() end
+    executeProjectFile(currentProject,mainFile,true,"test")
 end,COLORS.Accent)
 local editorSurface=make("Frame",{Position=UDim2.fromOffset(10,84),Size=UDim2.new(1,-20,1,-119),BackgroundColor3=COLORS.Panel,BorderSizePixel=0},editorPage)
 addCorner(editorSurface,8); addStroke(editorSurface,COLORS.Border,0.5)
-local treePanelWidth=compact and 106 or 164
-local treePanel=make("Frame",{Name="ProjectFileTree",Position=UDim2.fromOffset(7,7),Size=UDim2.new(0,treePanelWidth,1,-14),BackgroundColor3=COLORS.Panel2,BorderSizePixel=0},editorSurface)
-addCorner(treePanel,7)
-createLabel(treePanel,"FILES",UDim2.new(1,-10,0,20),UDim2.fromOffset(6,4),9,COLORS.Muted,Enum.Font.GothamBold)
+Settings.ProjectNavigation.treePanelWidth=compact and 106 or 164
+Settings.ProjectNavigation.treePanel=make("Frame",{Name="ProjectFileTree",Position=UDim2.fromOffset(7,7),Size=UDim2.new(0,Settings.ProjectNavigation.treePanelWidth,1,-14),BackgroundColor3=COLORS.Panel2,BorderSizePixel=0},editorSurface)
+addCorner(Settings.ProjectNavigation.treePanel,7)
+createLabel(Settings.ProjectNavigation.treePanel,"FILES",UDim2.new(1,-10,0,20),UDim2.fromOffset(6,4),9,COLORS.Muted,Enum.Font.GothamBold)
 local treeListTop=27
 local treeList=make("ScrollingFrame",{Name="FileTreeList",Position=UDim2.fromOffset(4,treeListTop),Size=UDim2.new(1,-8,1,-(treeListTop+4)),
-    BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,CanvasSize=UDim2.fromOffset(0,0)},treePanel)
+    BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,CanvasSize=UDim2.fromOffset(0,0)},Settings.ProjectNavigation.treePanel)
 local fileTreeLayout=make("UIListLayout",{Padding=UDim.new(0,2),SortOrder=Enum.SortOrder.LayoutOrder},treeList)
 fileTreeLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function() treeList.CanvasSize=UDim2.fromOffset(0,fileTreeLayout.AbsoluteContentSize.Y+6) end)
-local codePanel=make("Frame",{Name="CodePanel",Position=UDim2.fromOffset(treePanelWidth+14,0),Size=UDim2.new(1,-(treePanelWidth+21),1,0),BackgroundTransparency=1},editorSurface)
-editorFileLabel=createLabel(codePanel,"Select a file",UDim2.new(1,-268,0,25),UDim2.fromOffset(3,5),10,COLORS.Muted,Enum.Font.GothamBold)
-local newlineButton=createButton(codePanel,"Enter",UDim2.fromOffset(48,24),UDim2.new(1,-51,0,5),nil,COLORS.Panel2); newlineButton.TextSize=10
+Settings.ProjectNavigation.codePanel=make("Frame",{Name="CodePanel",Position=UDim2.fromOffset(Settings.ProjectNavigation.treePanelWidth+14,0),Size=UDim2.new(1,-(Settings.ProjectNavigation.treePanelWidth+21),1,0),BackgroundTransparency=1},editorSurface)
+editorFileLabel=createLabel(Settings.ProjectNavigation.codePanel,"Select a file",UDim2.new(1,-268,0,25),UDim2.fromOffset(3,5),10,COLORS.Muted,Enum.Font.GothamBold)
+Settings.ProjectNavigation.newlineButton=createButton(Settings.ProjectNavigation.codePanel,"Enter",UDim2.fromOffset(48,24),UDim2.new(1,-51,0,5),nil,COLORS.Panel2); Settings.ProjectNavigation.newlineButton.TextSize=10
 local gutterWidth=34
-local gutterBg=make("Frame",{Name="LineNumberGutter",Position=UDim2.fromOffset(3,32),Size=UDim2.new(0,gutterWidth,1,-38),
-    BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,ClipsDescendants=true},codePanel)
-addCorner(gutterBg,6)
+Settings.ProjectNavigation.gutterBg=make("Frame",{Name="LineNumberGutter",Position=UDim2.fromOffset(3,32),Size=UDim2.new(0,gutterWidth,1,-38),
+    BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,ClipsDescendants=true},Settings.ProjectNavigation.codePanel)
+addCorner(Settings.ProjectNavigation.gutterBg,6)
 local gutterLabel=make("TextLabel",{Name="LineNumbers",Position=UDim2.fromOffset(0,6),Size=UDim2.fromOffset(gutterWidth,220),
     BackgroundTransparency=1,BorderSizePixel=0,Text="1",TextColor3=COLORS.Muted,TextSize=compact and 11 or 13,
-    Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Right,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false},gutterBg)
+    Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Right,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false},Settings.ProjectNavigation.gutterBg)
 editorViewport=make("ScrollingFrame",{Name="CodeViewport",Position=UDim2.fromOffset(gutterWidth+3,32),Size=UDim2.new(1,-(gutterWidth+6),1,-38),BackgroundColor3=COLORS.Panel,
     BorderSizePixel=0,ClipsDescendants=true,ScrollBarThickness=compact and 5 or 7,ScrollBarImageColor3=COLORS.Muted,
-    ScrollingDirection=Enum.ScrollingDirection.XY,CanvasSize=UDim2.fromOffset(0,0),Active=true},codePanel)
+    ScrollingDirection=Enum.ScrollingDirection.XY,CanvasSize=UDim2.fromOffset(0,0),Active=true},Settings.ProjectNavigation.codePanel)
 addCorner(editorViewport,6)
 editorBox=make("TextBox",{Name="CodeEditor",Position=UDim2.fromOffset(8,6),Size=UDim2.fromOffset(320,220),BackgroundTransparency=1,BorderSizePixel=0,
     Text="",PlaceholderText="-- Start writing Luau code here...",PlaceholderColor3=COLORS.Muted,TextColor3=COLORS.Text,
@@ -1787,7 +2027,7 @@ BigCode.createVirtualPool = function()
         numberLabel.Text = ""
         numberLabel.Visible = false
         numberLabel.ZIndex = gutterLabel.ZIndex
-        numberLabel.Parent = gutterBg
+        numberLabel.Parent = Settings.ProjectNavigation.gutterBg
         BigCode.virtualGutterSlots[slotIndex] = numberLabel
         slot:GetPropertyChangedSignal("Text"):Connect(function()
             if not BigCode.mode or BigCode.rebuilding then return end
@@ -2134,7 +2374,7 @@ BigCode.render = function(fullText, restoreCanvasPosition, preferredChunkIndex)
     end
     local keepGutters = {}
     for _, label in ipairs(BigCode.virtualGutterSlots) do keepGutters[label] = true end
-    for _, child in ipairs(gutterBg:GetChildren()) do
+    for _, child in ipairs(Settings.ProjectNavigation.gutterBg:GetChildren()) do
         if child ~= gutterLabel and not keepGutters[child] then
             child:Destroy()
         end
@@ -2197,7 +2437,7 @@ BigCode.clearMode = function()
         editorViewport.CanvasSize = UDim2.fromOffset(0, 0)
         editorViewport.CanvasPosition = Vector2.new(0, 0)
     end
-    for _, child in ipairs(gutterBg:GetChildren()) do
+    for _, child in ipairs(Settings.ProjectNavigation.gutterBg:GetChildren()) do
         if child ~= gutterLabel then child:Destroy() end
     end
     if gutterLabel then
@@ -2472,66 +2712,74 @@ local function insertEditorNewline()
         if targetBox and targetBox.Parent and editorPage.Visible then targetBox:CaptureFocus() end
     end)
 end
-newlineButton.Activated:Connect(function() rememberCaret(); insertEditorNewline() end)
+Settings.ProjectNavigation.newlineButton.Activated:Connect(function() rememberCaret(); insertEditorNewline() end)
 do
-local pasteButton=createButton(codePanel,"Paste",UDim2.fromOffset(48,24),UDim2.new(1,-104,0,5),nil,COLORS.Accent)
-pasteButton.TextSize=10
-pasteButton.Activated:Connect(function()
-    if type(getclipboard) ~= "function" then
-        logConsole("Error", "getclipboard() is unavailable.")
-        openConsole()
-        return
+Settings.ProjectNavigation.pasteButton=createButton(Settings.ProjectNavigation.codePanel,"Paste",UDim2.fromOffset(48,24),UDim2.new(1,-104,0,5),nil,COLORS.Accent)
+Settings.ProjectNavigation.pasteButton.TextSize=10
+
+local function simulateCtrlV()
+    -- Способ 1: keypress/keyrelease (если поддерживает executor)
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        local success = pcall(function()
+            keypress(0x11) -- LeftControl
+            task.wait(0.05)
+            keypress(0x56) -- V
+            task.wait(0.05)
+            keyrelease(0x56)
+            keyrelease(0x11)
+        end)
+        if success then return true end
     end
-    if not currentProject then
-        logConsole("Error", "Open a project before pasting.")
-        openConsole()
-        return
+    
+    -- Способ 2: VirtualInputManager (CoreScript service, часто есть в executor'ах)
+    local ok_vim, vim = pcall(function() return game:GetService("VirtualInputManager") end)
+    if ok_vim and vim and type(vim.SendKeyEvent) == "function" then
+        local success = pcall(function()
+            vim:SendKeyEvent(true, Enum.KeyCode.LeftControl, false, game)
+            vim:SendKeyEvent(true, Enum.KeyCode.V, false, game)
+            task.wait(0.05)
+            vim:SendKeyEvent(false, Enum.KeyCode.V, false, game)
+            vim:SendKeyEvent(false, Enum.KeyCode.LeftControl, false, game)
+        end)
+        if success then return true end
     end
-    local ok, clipText = pcall(getclipboard)
-    if not ok or type(clipText) ~= "string" then
-        logConsole("Error", "Failed to read clipboard text.")
-        openConsole()
-        return
-    end
+    
+    return false
+end
+
+Settings.ProjectNavigation.pasteButton.Activated:Connect(function()
+    local targetBox = editorBox
     if BigCode.mode and BigCode.focusedEditor and BigCode.focusedEditor.Parent then
-        local targetBox = BigCode.focusedEditor
-        local source = targetBox.Text or ""
-        local cursor = targetBox.CursorPosition
-        local selection = targetBox.SelectionStart
-        if not cursor or cursor < 1 then cursor = #source + 1 end
-        if not selection or selection < 1 then selection = cursor end
-        local first = math.clamp(math.min(cursor, selection), 1, #source + 1)
-        local last = math.clamp(math.max(cursor, selection), 1, #source + 1)
-        targetBox.Text = string.sub(source, 1, first - 1) .. clipText .. string.sub(source, last)
-        local newCursor = first + #clipText
-        targetBox.CursorPosition = newCursor
-        targetBox.SelectionStart = newCursor
-        local complete = BigCode.getSource()
-        syncEditorToFile(currentProject, complete)
-        if targetBox and targetBox.Parent and targetBox.Visible then
-            targetBox:CaptureFocus()
-        end
-        editorStatus.Text = "Pasted into BigCode"
-        editorStatus.TextColor3 = COLORS.Green
-    elseif BigCode.shouldUsePreview(clipText) then
-        BigCode.render(clipText)
-        syncEditorToFile(currentProject, clipText)
-        editorStatus.Text = "Large file loaded - " .. #BigCode.chunks .. " editable sections"
-        editorStatus.TextColor3 = COLORS.Green
-        logConsole("Success", "Loaded large clipboard text: " .. #clipText .. " characters")
-    else
-        BigCode.clearMode()
-        editorBox.Visible = true
-        editorBox.TextEditable = true
-        editorBox.Text = clipText
-        editorBox.CursorPosition = #clipText + 1
-        editorBox.SelectionStart = #clipText + 1
-        syncEditorToFile(currentProject, clipText)
-        task.defer(measureEditorCanvas)
-        editorBox:CaptureFocus()
-        editorStatus.Text = "Clipboard pasted"
-        editorStatus.TextColor3 = COLORS.Green
+        targetBox = BigCode.focusedEditor
     end
+    
+    if not targetBox then return end
+
+    -- 1. Принудительно ставим фокус в редактор
+    targetBox:CaptureFocus()
+    
+    -- 2. Ждём мгновение для регистрации фокуса, затем имитируем Ctrl+V
+    task.delay(0.1, function()
+        if not targetBox:IsFocused() then return end
+        
+        local simulated = simulateCtrlV()
+        
+        if not simulated then
+            -- Если executor не поддерживает эмуляцию клавиш — фоллбек на ручную вставку
+            if logConsole then
+                logConsole("Info", "Editor focused. Press Ctrl+V (or your executor's paste shortcut) to insert.")
+            end
+            if editorStatus then
+                editorStatus.Text = "Editor focused. Press Ctrl+V."
+                editorStatus.TextColor3 = COLORS.Yellow
+            end
+        else
+            if editorStatus then
+                editorStatus.Text = "Ctrl+V simulated"
+                editorStatus.TextColor3 = COLORS.Green
+            end
+        end
+    end)
 end)
 end
 if touchDevice then
@@ -2583,84 +2831,302 @@ BigCode.updateAutoExecuteMenuButton=function()
 end
 renderFileTree=function()
     if not currentProject then return end
+    if Settings.ProjectNavigation.treeToggleButton then
+        Settings.ProjectNavigation.treeToggleButton.Text = "Tree"
+        Settings.ProjectNavigation.treeToggleButton.Visible = true
+        Settings.ProjectNavigation.treeToggleButton.Active = Settings.ProjectNavigation.viewingFile == true
+        Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = Settings.ProjectNavigation.viewingFile == true
+        Settings.ProjectNavigation.treeToggleButton.TextColor3 = Settings.ProjectNavigation.viewingFile and COLORS.Accent or COLORS.Muted
+    end
     for _,child in ipairs(treeList:GetChildren()) do
         if child:IsA("GuiObject") then child:Destroy() end
     end
+
     local children=buildTreeMap(currentProject)
     local order=0
-    local function addRows(parent,depth)
-        for _,entry in ipairs(children[parent] or {}) do
-            order=order+1
-            local selected=selectedTreePath==entry.path and selectedTreeIsFolder==entry.isFolder
-            local row=make("TextButton",{Name=entry.isFolder and "FolderRow" or "FileRow",Size=UDim2.new(1,-3,0,24),
-                BackgroundColor3=selected and COLORS.PanelHover or COLORS.Panel2,BorderSizePixel=0,Text="",
-                TextColor3=selected and COLORS.Accent or COLORS.Text,TextSize=9,
-                Font=entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code,TextXAlignment=Enum.TextXAlignment.Left,
-                AutoButtonColor=true,LayoutOrder=order},treeList)
-            addCorner(row,4)
-            local iconText
-            if entry.isFolder then
-                iconText=expandedFolders[entry.path]==false and "📁" or "📂"
-            elseif currentProject and currentProject.mainFile==entry.path then
-                iconText="⭐"
-            else
-                local extension=getFileExtension(entry.path)
-                if extension=="lua" or extension=="luau" then iconText="📄"
-                elseif extension=="json" then iconText="📋"
-                elseif extension=="txt" then iconText="📃"
-                elseif extension=="md" then iconText="📝"
-                else iconText="📄" end
-            end
-            local entryLabel=createLabel(row,iconText.."  "..entry.name,UDim2.new(1,-(depth*14+12),1,0),
-                UDim2.fromOffset(depth*14+6,0),9,selected and COLORS.Accent or COLORS.Text,
-                entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code)
-            entryLabel.TextTruncate=Enum.TextTruncate.AtEnd
-            row.Activated:Connect(function()
-                local now=os.clock()
-                local doubleClick=lastTreeClickPath==entry.path
-                    and lastTreeClickIsFolder==entry.isFolder
-                    and now-lastTreeClickTime<=0.38
-                lastTreeClickPath=entry.path
-                lastTreeClickIsFolder=entry.isFolder
-                lastTreeClickTime=now
-                selectedTreePath=entry.path
-                selectedTreeIsFolder=entry.isFolder
-                BigCode.updateAutoExecuteMenuButton()
-                if updatePathBar then updatePathBar() end
-                if doubleClick then
-                    if entry.isFolder then
-                        expandedFolders[entry.path]=expandedFolders[entry.path]==false
-                    else
-                        if BigCode.mode or editorBox.TextEditable then
-                            BigCode.syncCurrentFile()
-                        end
-                        if BigCode.clearMode then BigCode.clearMode() end
-                        currentProject.activeFile=entry.path
-                        refreshEditorFileHeader(entry.path)
-                        local fileSource=entry.file.code or ""
-                        if BigCode.shouldUsePreview(fileSource) then
-                            BigCode.render(fileSource)
-                        else
-                            editorBox.Visible=true
-                            editorBox.TextEditable=true
-                            editorBox.Text=fileSource
-                            task.defer(measureEditorCanvas)
-                        end
-                        editorViewport.CanvasPosition=Vector2.new(0,0)
-                        currentProject.updated=os.time()
-                        saveData()
-                    end
-                end
-                renderFileTree()
-            end)
-            if entry.isFolder and expandedFolders[entry.path]~=false then
-                addRows(entry.path,depth+1)
+
+    -- Parent directory navigation.
+    if Settings.ProjectNavigation.currentViewDir ~= "" then
+        order = order + 1
+        local backRow = make("TextButton", {
+            Name = "BackRow",
+            Size = UDim2.new(1,-3,0,24),
+            BackgroundColor3 = COLORS.Panel2,
+            BorderSizePixel = 0,
+            Text = "",
+            AutoButtonColor = true,
+            LayoutOrder = order,
+        }, treeList)
+        addCorner(backRow, 4)
+        createLabel(backRow, "🔙  ..", UDim2.new(1,-12,1,0), UDim2.fromOffset(6,0), 9, COLORS.Muted, Enum.Font.GothamBold)
+        backRow.Activated:Connect(function()
+            Settings.ProjectNavigation.currentViewDir = parentPath(Settings.ProjectNavigation.currentViewDir)
+            selectedTreePath = ""
+            selectedTreeIsFolder = true
+            lastTreeClickPath = nil
+            if updatePathBar then updatePathBar() end
+            renderFileTree()
+        end)
+    end
+
+    -- Only show direct children of the current directory.
+    for _,entry in ipairs(children[Settings.ProjectNavigation.currentViewDir] or {}) do
+        order = order + 1
+        local selected = selectedTreePath == entry.path and selectedTreeIsFolder == entry.isFolder
+        local row = make("TextButton", {
+            Name = entry.isFolder and "FolderRow" or "FileRow",
+            Size = UDim2.new(1,-3,0,24),
+            BackgroundColor3 = selected and COLORS.PanelHover or COLORS.Panel2,
+            BorderSizePixel = 0,
+            Text = "",
+            AutoButtonColor = true,
+            LayoutOrder = order,
+        }, treeList)
+        addCorner(row, 4)
+
+        local iconText = "📄"
+        if entry.isFolder then
+            iconText = "📁"
+        elseif currentProject and currentProject.mainFile == entry.path then
+            iconText = "⭐"
+        else
+            local ext = getFileExtension(entry.path)
+            if ext == "lua" or ext == "luau" then
+                iconText = "📜"
+            elseif ext == "json" then
+                iconText = "📋"
+            elseif ext == "md" then
+                iconText = "📝"
+            elseif ext == "txt" then
+                iconText = "📃"
             end
         end
+        local entryLabel = createLabel(row, iconText .. "  " .. entry.name, UDim2.new(1,-12,1,0),
+            UDim2.fromOffset(6,0), 9, selected and COLORS.Accent or COLORS.Text,
+            entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code)
+        entryLabel.TextTruncate = Enum.TextTruncate.AtEnd
+
+        row.Activated:Connect(function()
+            local now = os.clock()
+            local doubleClick = lastTreeClickPath == entry.path
+                and lastTreeClickIsFolder == entry.isFolder
+                and now - lastTreeClickTime <= 0.38
+            lastTreeClickPath = entry.path
+            lastTreeClickIsFolder = entry.isFolder
+            lastTreeClickTime = now
+
+            selectedTreePath = entry.path
+            selectedTreeIsFolder = entry.isFolder
+            BigCode.updateAutoExecuteMenuButton()
+            if updatePathBar then updatePathBar() end
+
+            if doubleClick then
+                lastTreeClickPath = nil
+                if entry.isFolder then
+                    Settings.ProjectNavigation.currentViewDir = entry.path
+                    selectedTreePath = ""
+                    selectedTreeIsFolder = true
+                    if updatePathBar then updatePathBar() end
+                    renderFileTree()
+                    return
+                end
+
+                -- Open the selected file in a full-screen editor view.
+                if currentProject and (BigCode.mode or editorBox.TextEditable) then
+                    BigCode.syncCurrentFile()
+                    saveData()
+                end
+                if BigCode.clearMode then BigCode.clearMode() end
+                currentProject.activeFile = entry.path
+                Settings.ProjectNavigation.viewingFile = true
+                if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
+                if toolsPanel then toolsPanel.Visible = false end
+                refreshEditorFileHeader(entry.path)
+                local currentFile = getProjectFile(currentProject, entry.path)
+                local fileSource = currentFile and currentFile.code or entry.file.code or ""
+
+                if Settings.ProjectNavigation.codePanel then
+                    Settings.ProjectNavigation.codePanel.Visible = true
+                    Settings.ProjectNavigation.codePanel.Position = UDim2.fromOffset(7, 0)
+                    Settings.ProjectNavigation.codePanel.Size = UDim2.new(1, -14, 1, 0)
+                end
+                if Settings.ProjectNavigation.treePanel then Settings.ProjectNavigation.treePanel.Visible = false end
+                if editorViewport then
+                    editorViewport.Visible = true
+                    editorViewport.CanvasPosition = Vector2.new(0,0)
+                end
+                if Settings.ProjectNavigation.gutterBg then Settings.ProjectNavigation.gutterBg.Visible = true end
+                if Settings.ProjectNavigation.newlineButton then Settings.ProjectNavigation.newlineButton.Visible = true end
+                if Settings.ProjectNavigation.pasteButton then Settings.ProjectNavigation.pasteButton.Visible = true end
+                if editorFileLabel then editorFileLabel.Visible = true end
+                if Settings.ProjectNavigation.backButton then
+                    Settings.ProjectNavigation.backButton.Text = "←"
+                    Settings.ProjectNavigation.backButton.Size = UDim2.fromOffset(34, 30)
+                    Settings.ProjectNavigation.backButton.TextSize = 18
+                end
+                if Settings.ProjectNavigation.treeToggleButton then
+                    Settings.ProjectNavigation.treeToggleButton.Visible = true
+                    Settings.ProjectNavigation.treeToggleButton.Active = true
+                    Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = true
+                    Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Accent
+                end
+
+                if BigCode.shouldUsePreview(fileSource) then
+                    BigCode.render(fileSource)
+                else
+                    editorBox.Visible = true
+                    editorBox.TextEditable = true
+                    editorBox.Text = fileSource
+                    task.defer(measureEditorCanvas)
+                end
+                currentProject.updated = os.time()
+                saveData()
+                if updatePathBar then updatePathBar() end
+                editorStatus.Text = "Editing: " .. entry.path
+                editorStatus.TextColor3 = COLORS.Green
+                return
+            end
+
+            renderFileTree()
+        end)
     end
-    addRows("",0)
     BigCode.updateAutoExecuteMenuButton()
 end
+
+Settings.ProjectNavigation.showCreateItemPopup = function()
+    if not currentProject then return end
+    local overlay = make("Frame", {
+        Name = "InputOverlay",
+        Size = UDim2.fromScale(1,1),
+        BackgroundColor3 = Color3.fromRGB(0,0,0),
+        BackgroundTransparency = 0.38,
+        BorderSizePixel = 0,
+        ZIndex = 80,
+        Active = true,
+    }, window)
+    local pw = math.min(360,windowWidth-30)
+    local ph = 210
+    local popup = make("Frame", {
+        Size = UDim2.fromOffset(pw,ph),
+        Position = UDim2.new(0.5,-pw/2,0.5,-ph/2),
+        BackgroundColor3 = COLORS.Panel,
+        BorderSizePixel = 0,
+        ZIndex = 81,
+        Active = true,
+    }, overlay)
+    addCorner(popup,10)
+    addStroke(popup,COLORS.Border)
+    local title = createLabel(popup,"Create New",UDim2.new(1,-24,0,28),UDim2.fromOffset(14,10),15,COLORS.Text,Enum.Font.GothamBold)
+    title.ZIndex = 82
+
+    -- Read-only current project path
+    local prefix = currentProject.name .. " / " .. (Settings.ProjectNavigation.currentViewDir ~= "" and Settings.ProjectNavigation.currentViewDir .. " / " or "")
+    local pathDisplay = make("TextLabel", {
+        Size = UDim2.new(1,-28,0,28),
+        Position = UDim2.fromOffset(14,45),
+        BackgroundColor3 = COLORS.Background,
+        BorderSizePixel = 0,
+        Text = prefix,
+        TextColor3 = COLORS.Muted,
+        TextSize = 11,
+        Font = Enum.Font.Code,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 82,
+    }, popup)
+    addCorner(pathDisplay,6)
+    make("UIPadding", {PaddingLeft = UDim.new(0,6)}, pathDisplay)
+
+    -- New path portion, entered on its own line
+    local input = make("TextBox", {
+        Size = UDim2.new(1,-28,0,34),
+        Position = UDim2.fromOffset(14,80),
+        BackgroundColor3 = COLORS.Panel2,
+        BorderSizePixel = 0,
+        Text = "",
+        PlaceholderText = "e.g. Folder/File.lua (no spaces)",
+        PlaceholderColor3 = COLORS.Muted,
+        TextColor3 = COLORS.Text,
+        TextSize = 12,
+        Font = Enum.Font.Code,
+        ClearTextOnFocus = false,
+        ZIndex = 83,
+    }, popup)
+    addCorner(input,7)
+
+    local message = createLabel(popup,"",UDim2.new(1,-28,0,18),UDim2.fromOffset(14,122),10,COLORS.Red)
+    message.ZIndex = 82
+    local cancel = createButton(popup,"Cancel",UDim2.fromOffset(88,32),UDim2.new(1,-190,1,-44),function()
+        overlay:Destroy()
+    end,COLORS.Panel2)
+    cancel.ZIndex = 82
+    local confirm = createButton(popup,"Create",UDim2.fromOffset(88,32),UDim2.new(1,-102,1,-44),function()
+        local value = trim(input.Text)
+        if value == "" then message.Text = "Path cannot be empty."; return end
+
+        -- Disallow whitespace in file and folder paths.
+        if value:find("%s") then
+            message.Text = "Spaces are not allowed. Use _ or -"
+            return
+        end
+
+        local fullPath = Settings.ProjectNavigation.currentViewDir ~= "" and (Settings.ProjectNavigation.currentViewDir .. "/" .. value) or value
+        local normalized = normalizePath(fullPath)
+        if not normalized then message.Text = "Invalid path."; return end
+
+        local isFile = getFileExtension(normalized) ~= ""
+        if isFile and not isSupportedFile(normalized) then
+            message.Text = "Unsupported file type."
+            return
+        end
+
+        -- If the requested folder already exists, navigate into it instead of failing.
+        if pathTaken(currentProject,normalized) then
+            if not isFile then
+                local isExistingFolder = false
+                for _, folder in ipairs(currentProject.folders or {}) do
+                    if folder == normalized then
+                        isExistingFolder = true
+                        break
+                    end
+                end
+                if isExistingFolder then
+                    Settings.ProjectNavigation.currentViewDir = normalized
+                    selectedTreePath = ""
+                    selectedTreeIsFolder = true
+                    lastTreeClickPath = nil
+                    if updatePathBar then updatePathBar() end
+                    renderFileTree()
+                    overlay:Destroy()
+                    return
+                end
+            end
+            message.Text = "Path already exists."
+            return
+        end
+
+        -- Create New is available only in the tree view, so no editor buffer needs syncing here.
+        ensureParentFolders(currentProject,normalized)
+        if isFile then
+            table.insert(currentProject.files,{path=normalized,code="",autoExecute=false})
+        else
+            table.insert(currentProject.folders,normalized)
+        end
+        selectedTreePath = ""
+        selectedTreeIsFolder = true
+        currentProject.updated = os.time()
+        saveData()
+        overlay:Destroy()
+        renderFileTree()
+        if updatePathBar then updatePathBar() end
+        if renderProjects then renderProjects() end
+        if renderExecutePage then renderExecutePage() end
+        logConsole("Success", "Created " .. (isFile and "file: " or "folder: ") .. normalized)
+    end,COLORS.Accent)
+    confirm.ZIndex = 82
+    input:CaptureFocus()
+end
+
 local function showPathPopup(title,initialText,confirmText,onConfirm)
     showTextPopup(title,initialText or "",confirmText or "Create",function(value)
         return onConfirm(value)
@@ -2913,7 +3379,9 @@ end
 updatePathBar=function()
     if not currentProject or not pathBar then return end
     local displayText=currentProject.name
-    if selectedTreePath~="" then displayText=displayText.." / "..selectedTreePath end
+    local displayPath=selectedTreePath
+    if displayPath=="" and not Settings.ProjectNavigation.viewingFile then displayPath=Settings.ProjectNavigation.currentViewDir end
+    if displayPath~="" then displayText=displayText.." / "..displayPath end
     pathBarUpdating=true
     local lastSlash=0
     local scan=1
@@ -2933,68 +3401,24 @@ updatePathBar=function()
     pathBarParts.inputOriginalText=pathBarParts.input.Text
     pathBarParts.updateSize()
     pathBarUpdating=false
-    pathCommitButton.Visible=false
+    pathCommitButton.Text="Save"
+    pathCommitButton.Visible=true
     pathCancelButton.Visible=false
 end
-setTreeVisibility=function(open)
-    isTreeOpen=open==true
-    treePanel.Visible=isTreeOpen
-    if isTreeOpen then
-        codePanel.Position=UDim2.fromOffset(treePanelWidth+14,0)
-        codePanel.Size=UDim2.new(1,-(treePanelWidth+21),1,0)
-    else
-        codePanel.Position=UDim2.fromOffset(7,0)
-        codePanel.Size=UDim2.new(1,-14,1,0)
-    end
-    if treeToggleButton then treeToggleButton.Text=isTreeOpen and "Tree" or "Tree +" end
-    task.defer(measureEditorCanvas)
-end
-editorMenu=make("Frame",{Name="EditorDropdown",Size=UDim2.fromOffset(compact and 142 or 164,220),
+Settings.ProjectNavigation.editorMenu=make("Frame",{Name="EditorDropdown",Size=UDim2.fromOffset(compact and 142 or 164,130),
     Position=UDim2.fromOffset(10,82),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,Visible=false,ZIndex=30,Active=true},editorPage)
-addCorner(editorMenu,8)
-addStroke(editorMenu,COLORS.Border)
-createLabel(editorMenu,"Editor",UDim2.new(1,-16,0,22),UDim2.fromOffset(8,3),11,COLORS.Text,Enum.Font.GothamBold).ZIndex=31
-local addFileMenuButton=createButton(editorMenu,"Add File",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,28),function()
-    editorMenu.Visible=false
-    if createNewFile then createNewFile() end
-end,COLORS.Panel2)
-addFileMenuButton.ZIndex=31
-local addFolderMenuButton=createButton(editorMenu,"Add Folder",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,59),function()
-    editorMenu.Visible=false
-    if createNewFolder then createNewFolder() end
-end,COLORS.Panel2)
-addFolderMenuButton.ZIndex=31
-BigCode.autoExecuteMenuButton=createButton(editorMenu,"Auto Execute: N/A",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,90),function()
-    editorMenu.Visible=false
-    if not currentProject or not selectedTreePath or selectedTreePath=="" then
-        logConsole("Warning","Select a script file first.")
-        openConsole()
-        return
-    end
-    if selectedTreeIsFolder then
-        logConsole("Warning","Folders cannot use Auto Execute. Select a .lua or .luau file.")
-        openConsole()
-        return
-    end
-    local file=getProjectFile(currentProject,selectedTreePath)
-    if not file or not isScriptFile(file.path) then
-        logConsole("Warning","Auto Execute is available only for .lua/.luau files.")
-        openConsole()
-        return
-    end
-    file.autoExecute=not (file.autoExecute==true)
-    currentProject.updated=os.time()
-    local saved,saveErr=saveData()
-    BigCode.updateAutoExecuteMenuButton()
-    if renderExecutePage then renderExecutePage() end
-    logConsole(saved and "Success" or "Warning",saved and (file.path.." Auto Execute: "..(file.autoExecute and "ON" or "OFF")) or tostring(saveErr))
-    if not saved then openConsole() end
-end,COLORS.Panel2)
-BigCode.autoExecuteMenuButton.ZIndex=31
-BigCode.updateAutoExecuteMenuButton()
+addCorner(Settings.ProjectNavigation.editorMenu,8)
+addStroke(Settings.ProjectNavigation.editorMenu,COLORS.Border)
+createLabel(Settings.ProjectNavigation.editorMenu,"Editor",UDim2.new(1,-16,0,22),UDim2.fromOffset(8,3),11,COLORS.Text,Enum.Font.GothamBold).ZIndex=31
+local createNewMenuButton=createButton(Settings.ProjectNavigation.editorMenu,"Create New",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,28),function()
+    Settings.ProjectNavigation.editorMenu.Visible=false
+    if Settings.ProjectNavigation.showCreateItemPopup then Settings.ProjectNavigation.showCreateItemPopup() end
+end,COLORS.Accent)
+createNewMenuButton.Name = "CreateNewButton"
+createNewMenuButton.ZIndex=31
 do
-local setMainMenuButton=createButton(editorMenu,"Set as Main",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,121),function()
-    editorMenu.Visible=false
+local setMainMenuButton=createButton(Settings.ProjectNavigation.editorMenu,"Set as Main",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,59),function()
+    Settings.ProjectNavigation.editorMenu.Visible=false
     if not currentProject then return end
     if not selectedTreePath or selectedTreePath=="" then
         logConsole("Warning","Select a file first.")
@@ -3014,8 +3438,8 @@ local setMainMenuButton=createButton(editorMenu,"Set as Main",UDim2.new(1,-12,0,
 end,COLORS.Accent)
 setMainMenuButton.ZIndex=31
 end
-local deleteMenuButton=createButton(editorMenu,"Delete",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,152),function()
-    editorMenu.Visible=false
+local deleteMenuButton=createButton(Settings.ProjectNavigation.editorMenu,"Delete",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,90),function()
+    Settings.ProjectNavigation.editorMenu.Visible=false
     if not selectedTreePath or selectedTreePath=="" then
         logConsole("Warning","Select a file or folder first.")
         openConsole()
@@ -3031,23 +3455,6 @@ local deleteMenuButton=createButton(editorMenu,"Delete",UDim2.new(1,-12,0,27),UD
     end)
 end,Color3.fromRGB(105,47,57))
 deleteMenuButton.ZIndex=31
-local sandboxMenuButton=createButton(editorMenu,"Sandbox",UDim2.new(1,-12,0,27),UDim2.fromOffset(6,183),function()
-    editorMenu.Visible=false
-    if not currentProject then
-        logConsole("Warning","Open a project first.")
-        openConsole()
-        return
-    end
-    local mainFile=getProjectFile(currentProject,currentProject.mainFile)
-    if not mainFile then
-        logConsole("Warning","Main file not found in project.")
-        openConsole()
-        return
-    end
-    executeProjectFile(currentProject,mainFile,true,"test")
-end,COLORS.Accent)
-sandboxMenuButton.ZIndex=31
-sandboxMenuButton.TextSize=10
 toolsPanel=make("Frame",{Name="ToolsPanel",Size=UDim2.fromOffset(compact and 190 or 220,187),Position=UDim2.fromOffset(48,48),
     BackgroundColor3=COLORS.Panel,BorderSizePixel=0,Visible=false,ZIndex=20,Active=true},editorPage)
 addCorner(toolsPanel,9); addStroke(toolsPanel,COLORS.Border)
@@ -3335,7 +3742,17 @@ Settings.REPLAY_HISTORY_FILE = ROOT_FOLDER .. "/replay_history.json"
 Settings.replaySaveHistory = function()
     if not fileStorageAvailable then return end
     ensureFolder()
-    local okEnc, encoded = pcall(function() return HttpService:JSONEncode(Settings.Replay.history) end)
+    local historyToSave = {}
+    for _, entry in ipairs(Settings.Replay.history) do
+        local savedEntry = {}
+        for key, value in pairs(entry) do
+            if key ~= "_cachedCode" then
+                savedEntry[key] = value
+            end
+        end
+        table.insert(historyToSave, savedEntry)
+    end
+    local okEnc, encoded = pcall(function() return HttpService:JSONEncode(historyToSave) end)
     if okEnc then pcall(writefile, Settings.REPLAY_HISTORY_FILE, encoded) end
 end
 Settings.replayLoadHistory = function()
@@ -3387,21 +3804,14 @@ end
 Settings.Replay.replayPush = function(waitTime, kind, codeLine, tx, ty, tz)
     local Replay = Settings.Replay
     table.insert(Replay.queue, {wait = waitTime, kind = kind, code = codeLine, targetX = tx, targetY = ty, targetZ = tz})
-    local count = #Replay.queue
-    if count >= Replay.maxEvents * 0.9 and not Replay.warned90 then
-        Replay.warned90 = true
-        logConsole("Warning", "Replay: 90% event limit reached ("..count.."/"..Replay.maxEvents..")")
-    end
-    if count >= Replay.maxEvents and Settings.replayStopAndSave then
-        Settings.replayStopAndSave()
-    end
 end
-Settings.Replay.replayGenerateCode = function()
+Settings.Replay.replayGenerateCode = function(queueOverride, durationOverride)
     local Replay = Settings.Replay
+    local queue = queueOverride or Replay.queue
     local lines = {}
-    local now = Replay.startTime > 0 and (os.clock() - Replay.startTime) or 0
+    local now = durationOverride or (Replay.startTime > 0 and (os.clock() - Replay.startTime) or 0)
     table.insert(lines, "-- Replay generated code")
-    table.insert(lines, "-- Events: " .. tostring(#Replay.queue))
+    table.insert(lines, "-- Events: " .. tostring(#queue))
     table.insert(lines, "-- Duration: " .. string.format("%.1f", now) .. " sec")
     table.insert(lines, "")
     table.insert(lines, "local Players = game:GetService(\"Players\")")
@@ -3422,7 +3832,7 @@ Settings.Replay.replayGenerateCode = function()
     table.insert(lines, "local hum = getHum()")
     table.insert(lines, "")
     local firstPos = nil
-    for _, item in ipairs(Replay.queue) do
+    for _, item in ipairs(queue) do
         if (item.kind == "pos" or item.kind == "walk" or item.kind == "jump") and item.targetX then
             firstPos = item
             break
@@ -3438,55 +3848,22 @@ Settings.Replay.replayGenerateCode = function()
 end]], firstPos.targetX, firstPos.targetY, firstPos.targetZ))
         table.insert(lines, "")
     end
-    table.insert(lines, [[ local function smoothMove(targetPos, duration)
-    local root = getRoot()
-    if not root then return end
-    local startPos = root.Position
-    local startCFrame = root.CFrame
-    local direction = targetPos - startPos
-    local flatDir = Vector3.new(direction.X, 0, direction.Z)
-    local targetCFrame
-    if flatDir.Magnitude > 0.1 then
-        targetCFrame = CFrame.lookAt(targetPos, targetPos + flatDir.Unit)
-    else
-        targetCFrame = CFrame.new(targetPos) * (startCFrame - startPos)
-    end
-    local t = 0
-    local totalTime = math.max(duration, 0.05)
-    local connection
-    connection = game:GetService("RunService").RenderStepped:Connect(function(dt)
-        if not root or not root.Parent then
-            if connection then connection:Disconnect() end
-            return
-        end
-        t = t + dt
-        local alpha = math.min(t / totalTime, 1)
-        root.CFrame = startCFrame:Lerp(targetCFrame, alpha)
-        root.AssemblyLinearVelocity = Vector3.zero
-        if alpha >= 1 then
-            if connection then connection:Disconnect() end
-        end
-    end)
-    task.wait(totalTime + 0.02)
-    if connection then connection:Disconnect() end
-end ]])
-    table.insert(lines, "")
     local prevWasPos = false
     local i = 1
-    while i <= #Replay.queue do
-        local item = Replay.queue[i]
+    while i <= #queue do
+        local item = queue[i]
         if item.kind == "walk" and item.targetX then
             local startIndex = i
             local totalTime = item.wait or 0
             local lastWalk = item
             local j = i + 1
-            while j <= #Replay.queue and Replay.queue[j].kind == "walk" and Replay.queue[j].targetX do
-                totalTime = totalTime + (Replay.queue[j].wait or 0)
-                lastWalk = Replay.queue[j]
+            while j <= #queue and queue[j].kind == "walk" and queue[j].targetX do
+                totalTime = totalTime + (queue[j].wait or 0)
+                lastWalk = queue[j]
                 j = j + 1
             end
             local dist = 0
-            local previousPoint = Replay.queue[startIndex - 1]
+            local previousPoint = queue[startIndex - 1]
             if previousPoint and previousPoint.targetX then
                 dist = math.sqrt(
                     (lastWalk.targetX - previousPoint.targetX)^2
@@ -3494,11 +3871,6 @@ end ]])
                     + (lastWalk.targetZ - previousPoint.targetZ)^2
                 )
             end
-            local walkSpeed = 16
-            if totalTime > 0.1 and dist > 0.5 then
-                walkSpeed = math.clamp(dist / totalTime, 16, 40)
-            end
-            table.insert(lines, string.format("hum.WalkSpeed = %.1f", walkSpeed))
             table.insert(lines, string.format("hum:MoveTo(Vector3.new(%.1f, %.1f, %.1f))", lastWalk.targetX, lastWalk.targetY, lastWalk.targetZ))
             table.insert(lines, string.format("task.wait(%.2f)", math.max(totalTime, 0.05)))
             prevWasPos = true
@@ -3508,9 +3880,10 @@ end ]])
                 table.insert(lines, string.format("task.wait(%.2f)", item.wait))
             end
             local nextWait = 0.3
-            if Replay.queue[i + 1] then nextWait = Replay.queue[i + 1].wait end
+            if queue[i + 1] then nextWait = queue[i + 1].wait end
             nextWait = math.max(nextWait, 0.15)
-            table.insert(lines, string.format("smoothMove(Vector3.new(%.1f, %.1f, %.1f), %.2f)", item.targetX, item.targetY, item.targetZ, nextWait))
+            table.insert(lines, string.format("do local h = getHum(); if h then h:MoveTo(Vector3.new(%.1f, %.1f, %.1f)); if h.FloorMaterial ~= Enum.Material.Air then h:ChangeState(Enum.HumanoidStateType.Jumping) end end end", item.targetX, item.targetY, item.targetZ))
+            table.insert(lines, string.format("task.wait(%.2f)", nextWait))
             prevWasPos = true
             i = i + 1
         elseif item.kind == "pos" and item.targetX then
@@ -3518,9 +3891,10 @@ end ]])
                 table.insert(lines, string.format("task.wait(%.2f)", item.wait))
             end
             local nextWait = 0.3
-            if Replay.queue[i + 1] then nextWait = Replay.queue[i + 1].wait end
+            if queue[i + 1] then nextWait = queue[i + 1].wait end
             nextWait = math.max(nextWait, 0.1)
-            table.insert(lines, string.format("smoothMove(Vector3.new(%.1f, %.1f, %.1f), %.2f)", item.targetX, item.targetY, item.targetZ, nextWait))
+            table.insert(lines, string.format("do local h = getHum(); if h then h:MoveTo(Vector3.new(%.1f, %.1f, %.1f)); if h.FloorMaterial ~= Enum.Material.Air then h:ChangeState(Enum.HumanoidStateType.Jumping) end end end", item.targetX, item.targetY, item.targetZ))
+            table.insert(lines, string.format("task.wait(%.2f)", nextWait))
             prevWasPos = true
             i = i + 1
         else
@@ -3536,7 +3910,7 @@ end ]])
     end
     table.insert(lines, "")
     table.insert(lines, "-- Cleanup after replay")
-    table.insert(lines, "do local hum = getHum(); if hum then hum.WalkSpeed = 16; hum:Move(Vector3.zero, false) end end")
+    table.insert(lines, "do local hum = getHum(); if hum then hum.Jump = false; hum:Move(Vector3.zero, false) end end")
     return table.concat(lines, "\n")
 end
 Settings.replayStopAndSave = function()
@@ -3558,22 +3932,33 @@ Settings.replayStopAndSave = function()
     Replay.hookOriginal = nil
     Replay.hookMetatable = nil
     if Replay.recBar then Replay.recBar.Visible = false end
+    if Replay.autoHiddenGui then
+        Replay.autoHiddenGui = false
+        if isHidden and toggleEasyScripting then
+            toggleEasyScripting()
+        end
+    end
     if Replay.recDotPulse then Replay.recDotPulse:Cancel() end
     Replay.generating = true
     if Replay.renderUI then Replay.renderUI() end
     task.spawn(function()
         task.wait(0.15)
-        local code = Replay.replayGenerateCode()
+        local queueSnapshot = Replay.queue
+        local queueSize = 0
+        local sizeOk, sizeEnc = pcall(function() return HttpService:JSONEncode(queueSnapshot) end)
+        if sizeOk and type(sizeEnc) == "string" then queueSize = #sizeEnc end
         local entry = {
             name = "Replay " .. os.date("%Y-%m-%d %H:%M:%S"),
-            code = code,
+            queue = queueSnapshot,
+            codeSize = queueSize,
             timestamp = os.time(),
-            events = #Replay.queue,
+            events = #queueSnapshot,
             duration = (Replay.startTime > 0 and (os.clock() - Replay.startTime) or 0),
         }
         table.insert(Replay.history, 1, entry)
         Settings.replaySaveHistory()
-        logConsole("Success", "Replay saved: " .. entry.name .. " (" .. entry.events .. " events)")
+        logConsole("Success", "Replay saved: " .. entry.name .. " (" .. entry.events .. " events, " .. tostring(entry.codeSize) .. " bytes)")
+
         Replay.generating = false
         Replay.viewMode = "list"
         if Replay.renderUI then Replay.renderUI() end
@@ -3748,12 +4133,21 @@ Settings.replayStart = function()
         Replay.hookMetatable = mt
         Replay.hookInstalled = true
     end)
+    if not isHidden and toggleEasyScripting then
+        Replay.autoHiddenGui = true
+        toggleEasyScripting()
+    else
+        Replay.autoHiddenGui = false
+    end
 end
 local function raiseZIndex(root,value)
     if root:IsA("GuiObject") then root.ZIndex=value end
     for _,child in ipairs(root:GetChildren()) do if child:IsA("GuiObject") then raiseZIndex(child,value+1) end end
 end
 local function makeToolWindow(name,titleText,width,height,onClose)
+    local maxW, maxH = Settings.getMaxToolSize()
+    width = math.min(width, maxW)
+    height = math.min(height, maxH)
     local frame=make("Frame",{Name=name,Size=UDim2.fromOffset(width,height),Position=UDim2.new(0.5,-width/2,0.5,-height/2),
         BackgroundColor3=COLORS.Background,BorderSizePixel=0,Visible=true,ZIndex=50,Active=true},screenGui)
     addCorner(frame,10); addStroke(frame,COLORS.Border)
@@ -3771,8 +4165,9 @@ Settings.openReplayCodeViewer = function(entry)
     if Replay.codeViewerWindow and Replay.codeViewerWindow.Parent then
         Replay.codeViewerWindow:Destroy()
     end
-    local vw = math.max(360, math.min(720, viewport.X - 40))
-    local vh = math.max(280, math.min(500, viewport.Y - 60))
+    local maxW, maxH = Settings.getMaxToolSize()
+    local vw = math.max(300, math.min(720, maxW))
+    local vh = math.max(240, math.min(500, maxH - 20))
     local frame = make("Frame", {Name="ReplayCodeViewer", Size=UDim2.fromOffset(vw,vh), Position=UDim2.new(0.5,-vw/2,0.5,-vh/2), BackgroundColor3=COLORS.Background, BorderSizePixel=0, ZIndex=3000, Active=true, ClipsDescendants=true}, screenGui)
     addCorner(frame, 10)
     addStroke(frame, COLORS.Border)
@@ -3788,8 +4183,22 @@ Settings.openReplayCodeViewer = function(entry)
     end, COLORS.Panel2)
     closeBtn.ZIndex=3002
     closeBtn.TextSize=16
-    local codeStr = entry.code or ""
-    local infoSize = #(codeStr or "")
+    local codeStr = entry.code
+    if not codeStr or codeStr == "" then
+        if entry._cachedCode then
+            codeStr = entry._cachedCode
+        elseif entry.queue then
+            local genOk, genCode = pcall(function()
+                return Settings.Replay.replayGenerateCode(entry.queue, entry.duration)
+            end)
+            if genOk and type(genCode) == "string" then
+                codeStr = genCode
+                entry._cachedCode = genCode
+            end
+        end
+    end
+    codeStr = codeStr or ""
+    local infoSize = #codeStr
     local sizeColor = COLORS.Muted
     if infoSize > 500000 then sizeColor = COLORS.Red
     elseif infoSize > 200000 then sizeColor = COLORS.Yellow end
@@ -3804,7 +4213,7 @@ Settings.openReplayCodeViewer = function(entry)
             task.delay(1, function() if copyBtn and copyBtn.Parent then copyBtn.Text = "Copy Code" end end)
             return
         end
-        local ok = pcall(setclipboard, entry.code or "")
+        local ok = pcall(setclipboard, codeStr)
         copyBtn.Text = ok and "Copied!" or "Copy failed"
         task.delay(1, function() if copyBtn and copyBtn.Parent then copyBtn.Text = "Copy Code" end end)
     end, COLORS.Accent)
@@ -3844,8 +4253,9 @@ Settings.openReplayHistory = function()
         Replay.historyWindow.Visible = true
         return
     end
-    local w = math.max(300, math.min(460, windowWidth - 30))
-    local h = 340
+    local maxW, maxH = Settings.getMaxToolSize()
+    local w = math.max(280, math.min(460, maxW))
+    local h = math.max(280, math.min(340, maxH))
     local frame, content
     frame, content = makeToolWindow("ReplayHistoryWindow", "Replay - All Recordings", w, h, function()
         frame.Visible = false
@@ -3893,23 +4303,26 @@ Settings.openReplayHistory = function()
 end
 Settings.openReplayWindow = function()
     local Replay = Settings.Replay
+    local hookOK, hookMissing = Replay.replayCanHookRemote()
+    Replay.hookSupported = hookOK
+    Replay.hookMissingInfo = hookMissing
+    if not hookOK then
+        logConsole("Warning", "Replay: hookmetamethod unavailable ("..tostring(hookMissing).."). RemoteEvent recording disabled.")
+        if Replay.recordMode == "all" or Replay.recordMode == "events" then
+            Replay.recordMode = "movement"
+        end
+    end
     if Replay.window and Replay.window.Parent then
         Replay.window.Visible = true
         Replay.viewMode = "list"
         if Replay.renderUI then Replay.renderUI() end
         return
     end
-    local hookOK, hookMissing = Replay.replayCanHookRemote()
-    Replay.hookSupported = hookOK
-    Replay.hookMissingInfo = hookMissing
-    if not hookOK then
-        logConsole("Warning", "Replay: hookmetamethod unavailable ("..tostring(hookMissing).."). RemoteEvent recording disabled.")
-    end
-    local w = math.max(340, math.min(500, windowWidth - 30))
-    local h = 420
+    local maxW, maxH = Settings.getMaxToolSize()
+    local w = math.max(280, math.min(500, maxW))
+    local h = math.max(300, math.min(420, maxH))
     local frame, content
     frame, content = makeToolWindow("ReplayWindow", "Replay", w, h, function()
-        if Replay.recording then Settings.replayStopAndSave() end
         frame.Visible = false
     end)
     Replay.window = frame
@@ -3941,15 +4354,17 @@ Settings.openReplayWindow = function()
         end, COLORS.Accent)
         newBtn.TextSize = 11
         newBtn.ZIndex = 55
-        local blacklistBtn = createButton(header, "Blacklist ("..#Replay.remoteBlacklist..")", UDim2.new(0.32, -4, 1, 0), UDim2.new(0.4, 0, 0, 0), function()
-            Replay.viewMode = "blacklist"
-            Replay.renderUI()
-        end, #Replay.remoteBlacklist > 0 and COLORS.Yellow or COLORS.Panel2)
-        blacklistBtn.TextSize = 10
-        blacklistBtn.ZIndex = 55
+        if Replay.hookSupported then
+            local blacklistBtn = createButton(header, "Blacklist ("..#Replay.remoteBlacklist..")", UDim2.new(0.32, -4, 1, 0), UDim2.new(0.4, 0, 0, 0), function()
+                Replay.viewMode = "blacklist"
+                Replay.renderUI()
+            end, #Replay.remoteBlacklist > 0 and COLORS.Yellow or COLORS.Panel2)
+            blacklistBtn.TextSize = 10
+            blacklistBtn.ZIndex = 55
+        end
         local totalSize = 0
         for _, e in ipairs(Replay.history) do
-            local s = #(e.code or "")
+            local s = e.codeSize or #(e.code or "")
             if s == 0 and e.queue then
                 local okS, enc = pcall(function() return HttpService:JSONEncode(e.queue) end)
                 if okS then s = #enc end
@@ -3982,7 +4397,7 @@ Settings.openReplayWindow = function()
             local row = make("Frame", {Size=UDim2.new(1,-8,0,56), BackgroundColor3=COLORS.Panel, BorderSizePixel=0, LayoutOrder=i, ZIndex=55}, list)
             addCorner(row, 6)
             addStroke(row, COLORS.Border, 0.5)
-            local codeSize = #(entry.code or "")
+            local codeSize = entry.codeSize or #(entry.code or "")
             if codeSize == 0 and entry.queue then
                 local okSize, encoded = pcall(function() return HttpService:JSONEncode(entry.queue) end)
                 if okSize then codeSize = #encoded end
@@ -4040,20 +4455,38 @@ Settings.openReplayWindow = function()
             currentMode = "all"
             Replay.recordMode = "all"
         end
-        local modeBtn = createButton(content, modeNames[currentMode], UDim2.new(1, -8, 0, 28), UDim2.fromOffset(4, 158), function()
-            if Replay.recordMode == "all" then
-                Replay.recordMode = "events"
-            elseif Replay.recordMode == "events" then
-                Replay.recordMode = "movement"
-            else
-                Replay.recordMode = "all"
-            end
-            Replay.renderUI()
-        end, modeColors[currentMode])
-        modeBtn.TextSize = 11
-        modeBtn.ZIndex = 55
-        createLabel(content, "Blacklist: "..#Replay.remoteBlacklist.." remote(s) ignored. Edit in List screen.", UDim2.new(1, -8, 0, 20), UDim2.fromOffset(4, 192), 9, COLORS.Muted).ZIndex = 55
-        local startBtn = createButton(content, "Start Recording", UDim2.new(1, -8, 0, 40), UDim2.new(0, 4, 0, 214), function()
+        if not Replay.hookSupported then
+            currentMode = "movement"
+            Replay.recordMode = "movement"
+            local staticLabel = createLabel(content, "Mode: Movement ONLY", UDim2.new(1, -8, 0, 28), UDim2.fromOffset(4, 158), 11, COLORS.Text, Enum.Font.GothamBold)
+            staticLabel.TextXAlignment = Enum.TextXAlignment.Center
+            staticLabel.BackgroundColor3 = COLORS.Green
+            staticLabel.BackgroundTransparency = 0.5
+            staticLabel.ZIndex = 55
+            addCorner(staticLabel, 8)
+            local hint = createLabel(content, "FireEvent hook unavailable — only movement recording. Reason: " .. tostring(Replay.hookMissingInfo or "unknown"), UDim2.new(1, -8, 0, 32), UDim2.fromOffset(4, 190), 9, COLORS.Muted)
+            hint.TextWrapped = true
+            hint.TextYAlignment = Enum.TextYAlignment.Top
+            hint.ZIndex = 55
+        else
+            local modeBtn = createButton(content, modeNames[currentMode], UDim2.new(1, -8, 0, 28), UDim2.fromOffset(4, 158), function()
+                if Replay.recordMode == "all" then
+                    Replay.recordMode = "events"
+                elseif Replay.recordMode == "events" then
+                    Replay.recordMode = "movement"
+                else
+                    Replay.recordMode = "all"
+                end
+                Replay.renderUI()
+            end, modeColors[currentMode])
+            modeBtn.TextSize = 11
+            modeBtn.ZIndex = 55
+        end
+        if Replay.hookSupported then
+            createLabel(content, "Blacklist: "..#Replay.remoteBlacklist.." remote(s) ignored. Edit in List screen.", UDim2.new(1, -8, 0, 20), UDim2.fromOffset(4, 192), 9, COLORS.Muted).ZIndex = 55
+        end
+        local startY = Replay.hookSupported and 214 or 232
+        local startBtn = createButton(content, "Start Recording", UDim2.new(1, -8, 0, 40), UDim2.new(0, 4, 0, startY), function()
             local kcName = trim(stopKeyBox.Text)
             if kcName ~= "" then
                 local ok, kc = pcall(function() return Enum.KeyCode[string.upper(kcName)] end)
@@ -4072,7 +4505,8 @@ Settings.openReplayWindow = function()
         end, COLORS.Accent)
         startBtn.TextSize = 12
         startBtn.ZIndex = 55
-        Replay.statusLabel = createLabel(content, "", UDim2.new(1, 0, 0, 20), UDim2.fromOffset(4, 258), 9, COLORS.Muted)
+        local statusY = Replay.hookSupported and 258 or 276
+        Replay.statusLabel = createLabel(content, "", UDim2.new(1, 0, 0, 20), UDim2.fromOffset(4, statusY), 9, COLORS.Muted)
         Replay.statusLabel.ZIndex = 55
     end
     local function renderRecording()
@@ -4265,7 +4699,14 @@ openAIChat = function()
         return
     end
     local aiKeys = loadAIKeys()
-    local chatWidth = compact and UDim2.fromOffset(340, 500) or UDim2.fromOffset(560, 560)
+    local maxW, maxH = Settings.getMaxToolSize()
+    local availableW = (editorPage and editorPage.AbsoluteSize.X > 0) and editorPage.AbsoluteSize.X or maxW
+    local availableH = (editorPage and editorPage.AbsoluteSize.Y > 0) and editorPage.AbsoluteSize.Y or maxH
+    local chatW = math.min(compact and 340 or 560, maxW, availableW - 8)
+    local chatH = math.min(compact and 500 or 560, maxH, availableH - 8)
+    chatW = math.max(240, chatW)
+    chatH = math.max(220, chatH)
+    local chatWidth = UDim2.fromOffset(chatW, chatH)
     local frame = make("Frame", {
         Name = "AIChatWindow",
         Size = chatWidth,
@@ -4324,6 +4765,12 @@ openAIChat = function()
     local sendButton, inputBox, statusLabel, messageList, listLayout
     local renderServices, renderModels, renderChat, sendAIMessage, openKeysEditor, addMessage
     local requestAI, regenerateLastResponse
+    local headerKeysButton = createButton(header, "Keys", UDim2.fromOffset(44, 28), UDim2.new(1, -82, 0, 6), function()
+        if openKeysEditor then openKeysEditor() end
+    end, COLORS.Panel2)
+    headerKeysButton.ZIndex = 82
+    headerKeysButton.TextSize = 10
+    titleLabel.Size = UDim2.new(1, -130, 1, 0)
     local function clearContent()
         for _, child in ipairs(contentArea:GetChildren()) do child:Destroy() end
         sendButton, inputBox, statusLabel, messageList, listLayout = nil, nil, nil, nil, nil
@@ -4668,9 +5115,7 @@ openAIChat = function()
         end, COLORS.Panel2)
         clearBtn.ZIndex = 82
         clearBtn.TextSize = 9
-        local keysBtn = createButton(contentArea, "Keys", UDim2.fromOffset(50, 18), UDim2.new(1, -84, 1, -64), openKeysEditor, COLORS.Panel2)
-        keysBtn.ZIndex = 82
-        keysBtn.TextSize = 9
+        -- Keys button moved to header (see headerKeysButton in openAIChat).
         local function updateCanvas()
             if not messageList or not messageList.Parent or not listLayout then return end
             messageList.CanvasSize = UDim2.fromOffset(0, listLayout.AbsoluteContentSize.Y + 16)
@@ -5056,14 +5501,15 @@ openAIChat = function()
             ZIndex = 200,
             Active = true,
         }, frame)
-        local pw = math.min(340, math.max(280, frame.AbsoluteSize.X - 24))
+        local maxW, maxH = Settings.getMaxToolSize()
+        local pw = math.min(340, math.max(260, frame.AbsoluteSize.X - 24))
         local providerKeyCount = 0
         for _, provider in ipairs(AI_PROVIDERS) do
             if provider.keyRequired or provider.id == "pollinations" then
                 providerKeyCount = providerKeyCount + 1
             end
         end
-        local ph = math.max(190, 112 + providerKeyCount * 36)
+        local ph = math.min(maxH, math.max(190, 112 + providerKeyCount * 36))
         local popup = make("Frame", {
             Size = UDim2.fromOffset(pw, ph),
             Position = UDim2.new(0.5, -pw / 2, 0.5, -ph / 2),
@@ -5463,7 +5909,9 @@ local function openScriptNotepad(scriptObject)
         sourceNote=sourceText
         resultKind="unsupported"
     end
-    local w=math.max(300,math.min(820,viewport.X-36)); local h=math.max(240,math.min(600,viewport.Y-50))
+    local maxW, maxH = Settings.getMaxToolSize()
+    local w = math.max(280, math.min(820, maxW))
+    local h = math.max(220, math.min(600, maxH))
     local frame,content
     frame,content=makeToolWindow("DexNotepad_"..tostring(#scriptViewerWindows+1),"Notepad - "..scriptObject.Name,w,h,function() frame.Visible=false end)
     table.insert(scriptViewerWindows,frame)
@@ -5579,7 +6027,9 @@ local function openDex()
         if DexAutoRefresh.SelectPartAttach then DexAutoRefresh.SelectPartAttach() end
         return
     end
-    local width=math.max(300,math.min(940,viewport.X-28)); local height=math.max(260,math.min(650,viewport.Y-36))
+    local maxW, maxH = Settings.getMaxToolSize()
+    local width = math.max(280, math.min(940, maxW))
+    local height = math.max(240, math.min(650, maxH))
     local selectedObject=game; local expanded={[game]=true}; local clickTimes=setmetatable({},{__mode="k"})
     local frame,content; local treeList,propertiesList,renderTree,updateProperties,searchBox
     local locateSelectedObject
@@ -5671,8 +6121,9 @@ local function openDex()
             return
         end
         closePreview3D()
-        local winW = math.max(240, math.min(560, width - 24))
-        local winH = math.max(220, math.min(460, height - 60))
+        local maxW, maxH = Settings.getMaxToolSize()
+        local winW = math.max(220, math.min(560, maxW))
+        local winH = math.max(200, math.min(460, maxH - 40))
         preview3DWindow = make("Frame", {
             Name = "Preview3D",
             Size = UDim2.fromOffset(winW, winH),
@@ -6797,7 +7248,9 @@ local function startFreeCam()
 end
 local function openFreeCam()
     if freeCamWindow then freeCamWindow.Visible=true; return end
-    local w=math.max(285,math.min(410,windowWidth-30)); local h=compact and 250 or 210
+    local maxW, maxH = Settings.getMaxToolSize()
+    local w = math.max(260, math.min(410, maxW))
+    local h = math.max(210, math.min(compact and 280 or 240, maxH))
     local frame,content; frame,content=makeToolWindow("FreeCamWindow","FreeCam - camera only",w,h,function() stopFreeCam(); frame.Visible=false end)
     freeCamWindow=frame
     Settings.registerModalWindow(freeCamWindow)
@@ -6855,4 +7308,13 @@ screenGui.Destroying:Connect(function()
 end)
 if Settings.updateSaveButtonVisibility then Settings.updateSaveButtonVisibility() end
 task.defer(function() Settings.replayLoadHistory() end)
+
 print("Easy Scripting "..VERSION.." loaded.")
+
+-- [ОТЧЁТ]
+-- 1. showCreateItemPopup: высота окна увеличена до 210 — да
+-- 2. pathDisplay на всю ширину (1,-28) с TextTruncate — да
+-- 3. input на всю ширину (1,-28), позиция Y=80 — да
+-- 4. Старая логика updateInputPos / prefixWidth удалена — да
+-- 5. Сообщение msg/message сдвинуто на Y=122 — да
+-- 6. Кнопки Cancel/Create и логика создания сохранены — да
