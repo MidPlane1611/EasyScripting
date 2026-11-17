@@ -61,7 +61,7 @@ local Settings = {
     },
     },
     SETTINGS_FILE = ROOT_FOLDER .. "/settings.json",
-    AppSettings = { theme="Default", userName="You", deviceMode="auto" },
+    AppSettings = { theme="Default", autoSave=false, userName="You", deviceMode="auto" },
 }
 Settings.loadSettings = function()
     if type(readfile) ~= "function" then return end
@@ -72,6 +72,7 @@ Settings.loadSettings = function()
         if type(data.theme) == "string" and Settings.THEMES[data.theme] then
             Settings.AppSettings.theme = data.theme
         end
+        Settings.AppSettings.autoSave = data.autoSave == true
         if type(data.userName) == "string" and data.userName ~= "" then
             Settings.AppSettings.userName = data.userName
         end
@@ -138,337 +139,6 @@ local SUPPORTED_FILE_TYPES={lua=true,luau=true,json=true,txt=true,md=true}
 local function getFileExtension(p) local n=leafName(p or ""); local e=n:match("%.([%w_%-]+)$"); return e and e:lower() or "" end
 local function isSupportedFile(p) return SUPPORTED_FILE_TYPES[getFileExtension(p)]==true end
 local function isScriptFile(p) local e=getFileExtension(p); return e=="lua" or e=="luau" end
-
--- GitHub-inspired Lua/Luau syntax highlighting. The source TextBox always
--- keeps plain text; only the separate RichText labels receive this markup.
-local SyntaxHighlight = {}
-
-SyntaxHighlight.Colors = {
-    Default = "#24292F",
-    Keyword = "#CF222E",
-    String = "#0A3069",
-    Comment = "#6E7781",
-    Number = "#0550AE",
-    Function = "#8250DF",
-    Builtin = "#953800",
-    Property = "#116329",
-}
-
-SyntaxHighlight.Keywords = {
-    ["and"]=true, ["break"]=true, ["do"]=true, ["else"]=true,
-    ["elseif"]=true, ["end"]=true, ["false"]=true, ["for"]=true,
-    ["function"]=true, ["if"]=true, ["in"]=true, ["local"]=true,
-    ["nil"]=true, ["not"]=true, ["or"]=true, ["repeat"]=true,
-    ["return"]=true, ["then"]=true, ["true"]=true, ["until"]=true,
-    ["while"]=true, ["continue"]=true, ["export"]=true, ["type"]=true,
-}
-
-SyntaxHighlight.Builtins = {
-    ["assert"]=true, ["error"]=true, ["ipairs"]=true,
-    ["next"]=true, ["pairs"]=true, ["pcall"]=true,
-    ["print"]=true, ["rawequal"]=true, ["rawget"]=true,
-    ["rawset"]=true, ["select"]=true, ["setmetatable"]=true,
-    ["getmetatable"]=true, ["tonumber"]=true, ["tostring"]=true,
-    ["type"]=true, ["typeof"]=true, ["unpack"]=true,
-    ["xpcall"]=true, ["require"]=true, ["warn"]=true,
-    ["wait"]=true, ["spawn"]=true, ["delay"]=true,
-    ["game"]=true, ["workspace"]=true, ["script"]=true,
-    ["Instance"]=true, ["Enum"]=true, ["Vector2"]=true,
-    ["Vector3"]=true, ["CFrame"]=true, ["Color3"]=true,
-    ["UDim"]=true, ["UDim2"]=true, ["TweenInfo"]=true,
-    ["task"]=true, ["math"]=true, ["string"]=true,
-    ["table"]=true, ["os"]=true, ["coroutine"]=true,
-}
-
-SyntaxHighlight.escape = function(value)
-    value = tostring(value or "")
-    value = value:gsub("&", "&amp;")
-    value = value:gsub("<", "&lt;")
-    value = value:gsub(">", "&gt;")
-    value = value:gsub('"', "&quot;")
-    value = value:gsub("'", "&apos;")
-    return value
-end
-
-local function syntaxNumberAt(source, position)
-    local tail = source:sub(position)
-    local candidates = {
-        tail:match("^(0[xX]%x+%.?%x*[pP][%+%-]?%d+)"),
-        tail:match("^(0[xX]%x+)"),
-        tail:match("^(0[bB][01]+)"),
-        tail:match("^(%d+%.%d*[eE][%+%-]?%d+)"),
-        tail:match("^(%d+[eE][%+%-]?%d+)"),
-        tail:match("^(%d+%.%d*)"),
-        tail:match("^(%d+)"),
-        tail:match("^(%.%d+[eE][%+%-]?%d+)"),
-        tail:match("^(%.%d+)")
-    }
-    local best = nil
-    for _, candidate in pairs(candidates) do
-        if candidate and (not best or #candidate > #best) then
-            best = candidate
-        end
-    end
-    -- Do not consume the first dot of a concatenation operator (1..value).
-    if best and best:sub(-1) == "." and source:sub(position + #best, position + #best) == "." then
-        best = best:sub(1, -2)
-    end
-    return best
-end
-
--- Returns (richText, outgoingLexerState). State is copied so callers can safely
--- reuse the previous chunk's outgoing state as the next chunk's incoming state.
-SyntaxHighlight.highlightLua = function(source, incomingState, stateOnly)
-    source = tostring(source or "")
-    local state = {
-        mode = type(incomingState) == "table" and incomingState.mode or nil,
-        equals = type(incomingState) == "table" and incomingState.equals or nil,
-        quote = type(incomingState) == "table" and incomingState.quote or nil,
-        escaped = type(incomingState) == "table" and incomingState.escaped == true or false,
-        previousSignificant = type(incomingState) == "table" and incomingState.previousSignificant or nil,
-    }
-    local output = {}
-    local length = #source
-
-    local function emit(text, color)
-        if stateOnly or text == nil or text == "" then return end
-        local escapedText = SyntaxHighlight.escape(text)
-        if color then
-            output[#output + 1] = '<font color="' .. color .. '">' .. escapedText .. '</font>'
-        else
-            output[#output + 1] = escapedText
-        end
-    end
-
-    local function closeDelimiter(equals)
-        return "]" .. (equals or "") .. "]"
-    end
-
-    local function updatePrevious(text)
-        if text and text ~= "" then
-            local last = text:sub(-1)
-            if not last:match("%s") then
-                state.previousSignificant = last
-            end
-        end
-    end
-
-    local i = 1
-    while i <= length do
-        -- A line comment may span virtual chunks when a very long line is split.
-        if state.mode == "line_comment" then
-            local lineEnd = source:find("\n", i, true)
-            if lineEnd then
-                emit(source:sub(i, lineEnd - 1), SyntaxHighlight.Colors.Comment)
-                i = lineEnd
-                state.mode = nil
-            else
-                emit(source:sub(i), SyntaxHighlight.Colors.Comment)
-                break
-            end
-
-        -- A long string/comment opened in a previous BigCode chunk.
-        elseif state.mode == "long_string" or state.mode == "long_comment" then
-            local wasComment = state.mode == "long_comment"
-            local color = wasComment and SyntaxHighlight.Colors.Comment or SyntaxHighlight.Colors.String
-            local closing = closeDelimiter(state.equals)
-            local closeStart, closeEnd = source:find(closing, i, true)
-            if closeStart then
-                local token = source:sub(i, closeEnd)
-                emit(token, color)
-                if not wasComment then updatePrevious(token) end
-                i = closeEnd + 1
-                state.mode = nil
-                state.equals = nil
-            else
-                emit(source:sub(i), color)
-                break
-            end
-
-        -- A quoted string can continue across chunks (including escaped newline).
-        elseif state.mode == "quoted_string" then
-            local start = i
-            local quote = state.quote or '"'
-            local closed = false
-            while i <= length do
-                local ch = source:sub(i, i)
-                if state.escaped then
-                    state.escaped = false
-                    i = i + 1
-                elseif ch == "\\" then
-                    state.escaped = true
-                    i = i + 1
-                elseif ch == quote then
-                    i = i + 1
-                    closed = true
-                    state.mode = nil
-                    state.quote = nil
-                    state.escaped = false
-                    break
-                elseif ch == "\n" then
-                    -- An unescaped newline terminates an invalid short string.
-                    state.mode = nil
-                    state.quote = nil
-                    state.escaped = false
-                    break
-                else
-                    i = i + 1
-                end
-            end
-            local token = source:sub(start, i - 1)
-            emit(token, SyntaxHighlight.Colors.String)
-            if closed then
-                state.previousSignificant = quote
-            end
-            if i > length and state.mode == "quoted_string" then break end
-
-        else
-            local ch = source:sub(i, i)
-            local nextTwo = source:sub(i, i + 1)
-
-            -- Line comments and long comments (--[[...]] / --[=[...]=]).
-            if nextTwo == "--" then
-                local equals = source:sub(i + 2):match("^%[(=*)%[")
-                if equals ~= nil then
-                    local openingLength = 4 + #equals
-                    local contentStart = i + openingLength
-                    local closing = closeDelimiter(equals)
-                    local _, closeEnd = source:find(closing, contentStart, true)
-                    state.mode = "long_comment"
-                    state.equals = equals
-                    if closeEnd then
-                        local token = source:sub(i, closeEnd)
-                        emit(token, SyntaxHighlight.Colors.Comment)
-                        i = closeEnd + 1
-                        state.mode = nil
-                        state.equals = nil
-                    else
-                        emit(source:sub(i), SyntaxHighlight.Colors.Comment)
-                        break
-                    end
-                else
-                    local lineEnd = source:find("\n", i, true)
-                    if lineEnd then
-                        emit(source:sub(i, lineEnd - 1), SyntaxHighlight.Colors.Comment)
-                        i = lineEnd
-                    else
-                        emit(source:sub(i), SyntaxHighlight.Colors.Comment)
-                        state.mode = "line_comment"
-                        break
-                    end
-                end
-
-            -- Long strings [=[...]=].
-            elseif ch == "[" then
-                local equals = source:sub(i):match("^%[(=*)%[")
-                if equals ~= nil then
-                    local openingLength = 2 + #equals
-                    local contentStart = i + openingLength
-                    local closing = closeDelimiter(equals)
-                    local _, closeEnd = source:find(closing, contentStart, true)
-                    state.mode = "long_string"
-                    state.equals = equals
-                    if closeEnd then
-                        local token = source:sub(i, closeEnd)
-                        emit(token, SyntaxHighlight.Colors.String)
-                        i = closeEnd + 1
-                        state.mode = nil
-                        state.equals = nil
-                        state.previousSignificant = "]"
-                    else
-                        emit(source:sub(i), SyntaxHighlight.Colors.String)
-                        break
-                    end
-                else
-                    emit(ch)
-                    state.previousSignificant = ch
-                    i = i + 1
-                end
-
-            -- Ordinary single- and double-quoted strings.
-            elseif ch == "'" or ch == '"' then
-                local start = i
-                local quote = ch
-                i = i + 1
-                state.mode = "quoted_string"
-                state.quote = quote
-                state.escaped = false
-                local closed = false
-                while i <= length do
-                    local current = source:sub(i, i)
-                    if state.escaped then
-                        state.escaped = false
-                        i = i + 1
-                    elseif current == "\\" then
-                        state.escaped = true
-                        i = i + 1
-                    elseif current == quote then
-                        i = i + 1
-                        closed = true
-                        state.mode = nil
-                        state.quote = nil
-                        state.escaped = false
-                        break
-                    elseif current == "\n" then
-                        state.mode = nil
-                        state.quote = nil
-                        state.escaped = false
-                        break
-                    else
-                        i = i + 1
-                    end
-                end
-                local token = source:sub(start, i - 1)
-                emit(token, SyntaxHighlight.Colors.String)
-                if closed then state.previousSignificant = quote end
-                if i > length and state.mode == "quoted_string" then break end
-
-            -- Identifiers: keywords, builtins, properties and function calls.
-            elseif ch:match("[%a_]") then
-                local word = source:sub(i):match("^([%a_][%w_]*)") or ch
-                local previous = state.previousSignificant
-                local isProperty = previous == "." or previous == ":"
-                local nextPosition = i + #word
-                while nextPosition <= length and source:sub(nextPosition, nextPosition):match("%s") do
-                    nextPosition = nextPosition + 1
-                end
-                local followedByCall = source:sub(nextPosition, nextPosition) == "("
-                local color
-                if SyntaxHighlight.Keywords[word] then
-                    color = SyntaxHighlight.Colors.Keyword
-                elseif SyntaxHighlight.Builtins[word] then
-                    color = SyntaxHighlight.Colors.Builtin
-                elseif followedByCall then
-                    color = SyntaxHighlight.Colors.Function
-                elseif isProperty then
-                    color = SyntaxHighlight.Colors.Property
-                end
-                emit(word, color)
-                state.previousSignificant = word:sub(-1)
-                i = i + #word
-
-            -- Numeric literals: decimal, exponent, hexadecimal and binary.
-            elseif ch:match("%d") or (ch == "." and source:sub(i + 1, i + 1):match("%d")) then
-                local number = syntaxNumberAt(source, i)
-                if number and number ~= "" then
-                    emit(number, SyntaxHighlight.Colors.Number)
-                    state.previousSignificant = number:sub(-1)
-                    i = i + #number
-                else
-                    emit(ch)
-                    if not ch:match("%s") then state.previousSignificant = ch end
-                    i = i + 1
-                end
-            else
-                emit(ch)
-                if not ch:match("%s") then state.previousSignificant = ch end
-                i = i + 1
-            end
-        end
-    end
-
-    return stateOnly and "" or table.concat(output), state
-end
 local function ensureParentFolders(project,path)
     local parent=parentPath(path)
     while parent~="" do
@@ -538,22 +208,10 @@ headerSubtitle.TextXAlignment=Enum.TextXAlignment.Left
 local toggleEasyScripting
 local minimizeButton=createButton(header,"–",UDim2.fromOffset(30,30),UDim2.new(1,-72,0,11),function() if toggleEasyScripting then toggleEasyScripting() end end,COLORS.Panel2)
 minimizeButton.TextSize=22
-local closeButton=createButton(header,"X",UDim2.fromOffset(30,30),UDim2.new(1,-40,0,11),function()
-    local session = Settings.EditorSession
-    if session and session.requestNavigation then
-        session.requestNavigation(function() screenGui:Destroy() end)
-    else
-        screenGui:Destroy()
-    end
-end,COLORS.Panel2)
+local closeButton=createButton(header,"X",UDim2.fromOffset(30,30),UDim2.new(1,-40,0,11),function() screenGui:Destroy() end,COLORS.Panel2)
 closeButton.TextSize=20
 local isHidden=false
 function toggleEasyScripting()
-    local session = Settings.EditorSession
-    if not isHidden and session and session.hasPendingChanges and session.hasPendingChanges() then
-        session.requestNavigation(function() toggleEasyScripting() end)
-        return
-    end
     isHidden=not isHidden
     screenGui.Enabled=not isHidden
     floatingButton.Visible=isHidden
@@ -637,7 +295,6 @@ local consoleWindow=nil
 local consoleList=nil
 local consoleCountLabel=nil
 local editorBox=nil
-local editorHighlightLabel=nil
 local editorViewport=nil
 local editorStatus=nil
 Settings.ProjectNavigation = {
@@ -654,20 +311,8 @@ local BigCode = {
     chunkWidths={},
     virtualSlots={},
     virtualGutterSlots={},
-    virtualHighlightSlots={},
     slotChunkIndices={},
-    chunkSyntaxStartStates={},
-    chunkSyntaxEndStates={},
     slotGutterCache={},
-    lines={},
-    lineByteStarts={},
-    lineSyntaxStartStates={},
-    lineSyntaxEndStates={},
-    linePoolIndices={},
-    virtualSelectionSlots={},
-    lineHeight=0,
-    lineMaxWidth=0,
-    caretFrame=nil,
     focusedEditor=nil,
     focusedChunkIndex=nil,
     rebuilding=false,
@@ -677,16 +322,6 @@ local BigCode = {
     totalHeight=0,
     poolSize=15,
 }
-local EditorSession = {
-    committedText = "",
-    committedPath = nil,
-    loading = false,
-    pendingNavigation = nil,
-    warningWindow = nil,
-}
-Settings.EditorSession = EditorSession
-local pathBarParts
-local measureEditorCanvas
 local editorFileLabel=nil
 local runCheckButton=nil
 local projectsPage=nil
@@ -823,8 +458,6 @@ local function refreshEditorFileHeader(path)
     if editorFileLabel then editorFileLabel.Text=path or "Select a file" end
     if editorBox then
         editorBox.TextEditable=path~=nil and path~=""
-        editorBox.Active=true
-        editorBox.Selectable=true
         if not path or path=="" then
             editorBox.PlaceholderText="Select a file from the project tree..."
         else
@@ -838,9 +471,6 @@ local function refreshEditorFileHeader(path)
     if path and runCheckButton then
         if isScriptFile(path) then runCheckButton.Text="Run"
         else runCheckButton.Text="Check" end
-    end
-    if Settings.refreshEditorSyntaxHighlight then
-        Settings.refreshEditorSyntaxHighlight(editorBox and editorBox.Text or "")
     end
 end
 local function getProjectFile(project,path)
@@ -1059,20 +689,12 @@ Settings.registerModalWindow=function(win)
 end
 local mainToolbar=make("Frame",{Size=UDim2.new(1,-24,0,44),Position=UDim2.fromOffset(12,8),BackgroundTransparency=1},projectsPage)
 Settings.page = nil
-local function showProjectsPage(skipNavigationCheck)
-    if not skipNavigationCheck and EditorSession.hasPendingChanges and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() showProjectsPage(true) end)
-        return
-    end
+local function showProjectsPage()
     projectsPage.Visible=true; executePage.Visible=false; editorPage.Visible=false
     if Settings.page then Settings.page.Visible=false end
     headerSubtitle.Text="HOME"; if renderProjects then renderProjects() end
 end
-local function showExecutePage(skipNavigationCheck)
-    if not skipNavigationCheck and EditorSession.hasPendingChanges and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() showExecutePage(true) end)
-        return
-    end
+local function showExecutePage()
     projectsPage.Visible=false; executePage.Visible=true; editorPage.Visible=false
     if Settings.page then Settings.page.Visible=false end
     headerSubtitle.Text="EXECUTE"; if renderExecutePage then renderExecutePage() end
@@ -1092,11 +714,7 @@ createButton(mainToolbar,"Settings",UDim2.fromOffset(Settings.settingsButtonWidt
 end,COLORS.Panel2)
 createButton(mainToolbar,"Execute",UDim2.fromOffset(Settings.executeButtonWidth,34),UDim2.fromOffset(Settings.executeButtonX,4),showExecutePage,COLORS.Panel2)
 Settings.page = make("Frame",{Name="SettingsPage",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Visible=false},body)
-Settings.showSettingsPage = function(skipNavigationCheck)
-    if not skipNavigationCheck and EditorSession.hasPendingChanges and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() Settings.showSettingsPage(true) end)
-        return
-    end
+Settings.showSettingsPage = function()
     projectsPage.Visible=false
     executePage.Visible=false
     editorPage.Visible=false
@@ -1173,6 +791,24 @@ Settings.showSettingsPage = function(skipNavigationCheck)
         button.TextSize = 10
     end
 
+    -- === Auto Save Card ===
+    local autoCard = makeSettingsCard("Auto Save", 110)
+    local autoDesc = createLabel(autoCard,
+        "When enabled, the Save button becomes Auto: ON and the current file saves automatically while you type.",
+        UDim2.new(1,-20,0,32), UDim2.fromOffset(10,30),10,COLORS.Muted)
+    autoDesc.TextWrapped = true
+    autoDesc.TextYAlignment = Enum.TextYAlignment.Top
+
+    local toggleButton = createButton(autoCard,
+        Settings.AppSettings.autoSave and "Auto Save: ON" or "Auto Save: OFF",
+        UDim2.fromOffset(180,36), UDim2.fromOffset(10,66), function()
+            Settings.AppSettings.autoSave = not Settings.AppSettings.autoSave
+            Settings.saveSettings()
+            if Settings.updateSaveButtonVisibility then Settings.updateSaveButtonVisibility() end
+            Settings.showSettingsPage()
+        end, Settings.AppSettings.autoSave and COLORS.Green or COLORS.Panel2)
+    toggleButton.TextSize = 11
+
     -- === Your Name Card ===
     local nameCard = makeSettingsCard("Your Name", 100)
     createLabel(nameCard, "This name is displayed above your messages in AI Chat.", UDim2.new(1,-20,0,20), UDim2.fromOffset(10,30), 10, COLORS.Muted)
@@ -1245,40 +881,42 @@ local function syncEditorToFile(project,src)
     project.code=file.code or ""; project.updated=os.time()
     return file
 end
+Settings.autoSavePending = false
+Settings.autoSaveDelay = 1.5
+Settings.autoSaveToken = 0
+Settings.debouncedAutoSave = function()
+    if not Settings.AppSettings.autoSave or not currentProject then return end
+    Settings.autoSavePending = true
+    Settings.autoSaveToken = Settings.autoSaveToken + 1
+    local requestToken = Settings.autoSaveToken
+    local targetProject = currentProject
+    task.delay(Settings.autoSaveDelay,function()
+        if requestToken ~= Settings.autoSaveToken then return end
+        Settings.autoSavePending = false
+        if not Settings.AppSettings.autoSave or currentProject ~= targetProject then return end
+        local source
+        if BigCode.mode and BigCode.getSource then
+            source = BigCode.getSource()
+        elseif editorBox then
+            source = editorBox.Text
+        end
+        if source ~= nil then
+            syncEditorToFile(targetProject,source)
+        end
+        local saved = saveData()
+        if saved and editorStatus then
+            editorStatus.Text = "Auto-saved - " .. getProjectSize(targetProject)
+            editorStatus.TextColor3 = COLORS.Green
+        elseif editorStatus then
+            editorStatus.Text = "Auto-save: session only"
+            editorStatus.TextColor3 = COLORS.Yellow
+        end
+    end)
+end
 BigCode.syncCurrentFile = function()
     if not currentProject then return nil end
     local source = BigCode.mode and BigCode.getSource() or (editorBox and editorBox.Text or "")
     return syncEditorToFile(currentProject, source)
-end
-
-EditorSession.getCurrentSource = function()
-    if BigCode.mode then
-        return BigCode.getSource()
-    end
-    return editorBox and editorBox.Text or ""
-end
-
-EditorSession.isDirty = function()
-    if EditorSession.loading or not currentProject or not Settings.ProjectNavigation.viewingFile then
-        return false
-    end
-    return EditorSession.getCurrentSource() ~= EditorSession.committedText
-end
-
-EditorSession.hasPendingChanges = function()
-    local pathDirty = pathBarParts
-        and pathBarParts.input
-        and pathBarParts.input.Text ~= (pathBarParts.inputOriginalText or "")
-    return EditorSession.isDirty() or pathDirty == true
-end
-
-EditorSession.setBaseline = function(path, source)
-    EditorSession.committedPath = path
-    EditorSession.committedText = tostring(source or "")
-    EditorSession.loading = false
-    if EditorSession.updateButtons then
-        EditorSession.updateButtons()
-    end
 end
 local function updateProjectCardMeta(project,l)
     if l then l.Text="Roblox project  -  "..getProjectSize(project).."  -  "..tostring(#project.files).." file(s)" end
@@ -1325,18 +963,16 @@ local function showRenameProjectPopup(project)
         return true
     end)
 end
-local function openProject(project, skipNavigationCheck)
-    if not skipNavigationCheck and currentProject and EditorSession.hasPendingChanges and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() openProject(project, true) end)
-        return
+local function openProject(project)
+    if currentProject and (BigCode.mode or (editorBox and editorBox.TextEditable)) then
+        BigCode.syncCurrentFile()
+        saveData()
     end
     if BigCode.clearMode then BigCode.clearMode() end
     currentProject=project
     ensureProjectStructure(project)
-    EditorSession.loading=true
     editorBox.TextEditable=false
     editorBox.Text=""
-    EditorSession.setBaseline(nil, "")
     editorBox.PlaceholderText="Select a file from the project tree..."
     if editorViewport then editorViewport.CanvasPosition=Vector2.new(0,0) end
     selectedTreePath=""
@@ -1880,7 +1516,7 @@ local navBar=make("Frame",{Name="EditorNavBar",Size=UDim2.new(1,-20,0,36),Positi
 local actionBar=make("ScrollingFrame",{Name="EditorActionBar",Size=UDim2.new(1,-20,0,36),Position=UDim2.fromOffset(10,44),BackgroundTransparency=1,ScrollBarThickness=4,ScrollBarImageColor3=COLORS.Muted,ScrollingDirection=Enum.ScrollingDirection.X,CanvasSize=UDim2.fromOffset(0,0),BorderSizePixel=0,Active=true},editorPage)
 Settings.actionBarContent=make("Frame",{Name="EditorActionBarContent",Size=UDim2.new(1,0,1,0),BackgroundTransparency=1},actionBar)
 local pathBarUpdating=false
-pathBarParts={inputOriginalText=""}
+local pathBarParts={inputOriginalText=""}
 local pathBar=make("Frame",{Name="PathBar",Size=UDim2.new(1,-222,1,0),Position=UDim2.fromOffset(88,0),
     BackgroundColor3=COLORS.Panel2,BorderSizePixel=0},navBar)
 addCorner(pathBar,7); addStroke(pathBar,COLORS.Border,0.5)
@@ -1905,70 +1541,74 @@ pathBarParts.updateSize=function()
 end
 pathBarParts.prefixLabel:GetPropertyChangedSignal("Text"):Connect(pathBarParts.updateSize)
 Settings.ProjectNavigation.backButton=createButton(navBar,"←",UDim2.fromOffset(34,30),UDim2.fromOffset(0,3),function()
-    EditorSession.requestNavigation(function()
-        if Settings.ProjectNavigation.viewingFile then
-            if BigCode.clearMode then BigCode.clearMode() end
-            Settings.ProjectNavigation.viewingFile = false
-            editorBox.TextEditable = false
-            editorBox.Visible = false
-            if editorHighlightLabel then editorHighlightLabel.Visible = false end
-        end
-        if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
-        if toolsPanel then toolsPanel.Visible = false end
-        if Settings.ProjectNavigation.treeToggleButton then
-            Settings.ProjectNavigation.treeToggleButton.Active = false
-            Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
-            Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
-        end
-        editorPage.Visible=false
-        projectsPage.Visible=true
-        headerSubtitle.Text="HOME"
-        renderProjects()
-    end)
+    -- The arrow always returns to the Home projects page.
+    if currentProject and (BigCode.mode or editorBox.TextEditable) then
+        BigCode.syncCurrentFile()
+        saveData()
+    end
+    if Settings.ProjectNavigation.viewingFile then
+        if BigCode.clearMode then BigCode.clearMode() end
+        Settings.ProjectNavigation.viewingFile = false
+        editorBox.TextEditable = false
+        editorBox.Visible = false
+    end
+    if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
+    if toolsPanel then toolsPanel.Visible = false end
+    if Settings.ProjectNavigation.treeToggleButton then
+        Settings.ProjectNavigation.treeToggleButton.Active = false
+        Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
+        Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
+    end
+    editorPage.Visible=false
+    projectsPage.Visible=true
+    headerSubtitle.Text="HOME"
+    renderProjects()
 end,COLORS.Panel2)
 Settings.ProjectNavigation.backButton.TextSize=18
 Settings.ProjectNavigation.treeToggleButton=createButton(navBar,"Tree",UDim2.fromOffset(48,30),UDim2.fromOffset(38,3),function()
     local nav = Settings.ProjectNavigation
     if not nav.viewingFile then return end
-    EditorSession.requestNavigation(function()
-        if BigCode.clearMode then BigCode.clearMode() end
-        nav.viewingFile = false
-        editorBox.TextEditable = false
-        editorBox.Visible = false
-        if editorHighlightLabel then editorHighlightLabel.Visible = false end
 
-        if nav.treePanel then
-            nav.treePanel.Visible = true
-            nav.treePanel.Position = UDim2.fromOffset(7, 7)
-            nav.treePanel.Size = UDim2.new(1, -14, 1, -14)
-        end
-        if nav.codePanel then
-            nav.codePanel.Visible = false
-            nav.codePanel.Position = UDim2.fromOffset(nav.treePanelWidth + 14, 0)
-            nav.codePanel.Size = UDim2.new(1, -(nav.treePanelWidth + 21), 1, 0)
-        end
-        if editorViewport then editorViewport.Visible = false end
-        if nav.gutterBg then nav.gutterBg.Visible = false end
-        if nav.newlineButton then nav.newlineButton.Visible = false end
-        if nav.pasteButton then nav.pasteButton.Visible = false end
-        if editorFileLabel then editorFileLabel.Visible = false end
-        if nav.editorMenu then nav.editorMenu.Visible = false end
-        if toolsPanel then toolsPanel.Visible = false end
+    -- Save the current file, then switch from the editor to the full-screen tree.
+    if currentProject and (BigCode.mode or editorBox.TextEditable) then
+        BigCode.syncCurrentFile()
+        saveData()
+    end
+    if BigCode.clearMode then BigCode.clearMode() end
+    nav.viewingFile = false
+    editorBox.TextEditable = false
+    editorBox.Visible = false
 
-        if nav.backButton then
-            nav.backButton.Text = "←"
-            nav.backButton.Size = UDim2.fromOffset(34, 30)
-            nav.backButton.TextSize = 18
-        end
-        nav.treeToggleButton.Active = false
-        nav.treeToggleButton.AutoButtonColor = false
-        nav.treeToggleButton.TextColor3 = COLORS.Muted
-        if updatePathBar then updatePathBar() end
-        if renderFileTree then renderFileTree() end
-        editorStatus.Text = "Project tree"
-        editorStatus.TextColor3 = COLORS.Muted
-        if EditorSession.updateButtons then EditorSession.updateButtons() end
-    end)
+    if nav.treePanel then
+        nav.treePanel.Visible = true
+        nav.treePanel.Position = UDim2.fromOffset(7, 7)
+        nav.treePanel.Size = UDim2.new(1, -14, 1, -14)
+    end
+    if nav.codePanel then
+        nav.codePanel.Visible = false
+        nav.codePanel.Position = UDim2.fromOffset(nav.treePanelWidth + 14, 0)
+        nav.codePanel.Size = UDim2.new(1, -(nav.treePanelWidth + 21), 1, 0)
+    end
+    if editorViewport then editorViewport.Visible = false end
+    if nav.gutterBg then nav.gutterBg.Visible = false end
+    if nav.newlineButton then nav.newlineButton.Visible = false end
+    if nav.pasteButton then nav.pasteButton.Visible = false end
+    if editorFileLabel then editorFileLabel.Visible = false end
+    if nav.editorMenu then nav.editorMenu.Visible = false end
+    if toolsPanel then toolsPanel.Visible = false end
+
+    if nav.backButton then
+        nav.backButton.Text = "←"
+        nav.backButton.Size = UDim2.fromOffset(34, 30)
+        nav.backButton.TextSize = 18
+    end
+    nav.treeToggleButton.Active = false
+    nav.treeToggleButton.AutoButtonColor = false
+    nav.treeToggleButton.TextColor3 = COLORS.Muted
+    if updatePathBar then updatePathBar() end
+    if renderFileTree then renderFileTree() end
+    editorStatus.Text = "Project tree"
+    editorStatus.TextColor3 = COLORS.Muted
 end,COLORS.Panel2)
 Settings.ProjectNavigation.treeToggleButton.TextSize=compact and 9 or 10
 Settings.ProjectNavigation.treeToggleButton.Visible = true
@@ -1977,229 +1617,85 @@ Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = false
 Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Muted
 local pathCommitButton
 local pathCancelButton
-pathCommitButton=createButton(navBar,"Commit",UDim2.fromOffset(58,30),UDim2.new(1,-120,0,3),function()
-    if EditorSession.commit then EditorSession.commit() end
+pathCommitButton=createButton(navBar,"Save",UDim2.fromOffset(58,30),UDim2.new(1,-120,0,3),function()
+    -- Always save the current editor source first.
+    if currentProject then
+        local textToSave
+        if BigCode.mode then
+            textToSave = BigCode.getSource()
+            syncEditorToFile(currentProject, textToSave)
+        elseif editorBox.TextEditable then
+            textToSave = editorBox.Text
+            syncEditorToFile(currentProject, textToSave)
+        end
+        local saved, message = saveData()
+        if saved then
+            editorStatus.Text = "Saved - " .. getProjectSize(currentProject)
+            editorStatus.TextColor3 = COLORS.Green
+            logConsole("Success", "Saved " .. currentProject.name)
+        else
+            editorStatus.Text = "Session copy updated"
+            editorStatus.TextColor3 = COLORS.Yellow
+            logConsole("Warning", message)
+        end
+    end
+
+    -- If the path was edited, also rename the selected item.
+    if pathBarParts.input.Text ~= pathBarParts.inputOriginalText then
+        if selectedTreePath=="" then
+            pathBarUpdating=true
+            pathBarParts.input.Text=pathBarParts.inputOriginalText
+            pathBarUpdating=false
+            pathCommitButton.Text="Save"
+            pathCancelButton.Visible=false
+            return
+        end
+        if not currentProject or not renameSelectedPath then return end
+        local typedSuffix=trim(pathBarParts.input.Text)
+        local prefixText=pathBarParts.prefixLabel.Text
+        local projectPrefix=currentProject.name.." / "
+        local folderPart=""
+        if string.sub(prefixText,1,#projectPrefix)==projectPrefix then
+            folderPart=string.sub(prefixText,#projectPrefix+1)
+            folderPart=folderPart:gsub("%s*/%s*$","")
+        end
+        local typedPath=typedSuffix
+        if folderPart~="" then typedPath=folderPart.."/"..typedSuffix end
+        typedPath=typedPath:gsub("%s*/%s*","/")
+        local ok,err=renameSelectedPath(typedPath)
+        if not ok then
+            editorStatus.Text="Rename failed: "..tostring(err or "Invalid path")
+            editorStatus.TextColor3=COLORS.Red
+            logConsole("Error","Path Bar rename failed: "..tostring(err or "Invalid path"))
+        else
+            if updatePathBar then updatePathBar() end
+        end
+    end
+    pathCommitButton.Text = "Save"
+    pathCancelButton.Visible = false
 end,COLORS.Green)
 pathCommitButton.TextSize=compact and 8 or 10
 pathCommitButton.Visible=true
 pathCancelButton=createButton(navBar,"Cancel",UDim2.fromOffset(54,30),UDim2.new(1,-58,0,3),function()
-    if EditorSession.cancel then EditorSession.cancel() end
+    pathBarUpdating=true
+    pathBarParts.input.Text=pathBarParts.inputOriginalText
+    pathBarUpdating=false
+    pathCommitButton.Text="Save"
+    pathCancelButton.Visible=false
 end,COLORS.Panel2)
 pathCancelButton.TextSize=compact and 8 or 10
 pathCancelButton.Visible=false
 pathBarParts.input:GetPropertyChangedSignal("Text"):Connect(function()
     if pathBarUpdating then return end
-    if EditorSession.updateButtons then EditorSession.updateButtons() end
+    local changed=pathBarParts.input.Text~=pathBarParts.inputOriginalText
+    if changed then
+        pathCommitButton.Text = "Commit"
+        pathCancelButton.Visible = true
+    else
+        pathCommitButton.Text = "Save"
+        pathCancelButton.Visible = false
+    end
 end)
-
-EditorSession.updateButtons = function()
-    if not pathCommitButton or not pathCancelButton then return end
-    local codeDirty = EditorSession.isDirty()
-    local pathDirty = pathBarParts
-        and pathBarParts.input
-        and pathBarParts.input.Text ~= (pathBarParts.inputOriginalText or "")
-    local hasChanges = codeDirty or pathDirty == true
-    pathCommitButton.Text = "Commit"
-    pathCommitButton.Active = hasChanges
-    pathCommitButton.AutoButtonColor = hasChanges
-    pathCommitButton.Selectable = hasChanges
-    pathCommitButton.BackgroundColor3 = hasChanges and COLORS.Green or COLORS.Panel2
-    pathCancelButton.Visible = hasChanges
-end
-
-EditorSession.commit = function()
-    if not currentProject then return false end
-    local codeDirty = EditorSession.isDirty()
-    local pathDirty = pathBarParts
-        and pathBarParts.input
-        and pathBarParts.input.Text ~= (pathBarParts.inputOriginalText or "")
-
-    if not codeDirty and not pathDirty then
-        if EditorSession.updateButtons then EditorSession.updateButtons() end
-        return true
-    end
-
-    if codeDirty and not Settings.ProjectNavigation.viewingFile then
-        return false
-    end
-
-    -- Rename first, so a failed path validation cannot partially commit the code draft.
-    if pathDirty then
-        if selectedTreePath == "" then
-            editorStatus.Text = "The project root cannot be renamed here."
-            editorStatus.TextColor3 = COLORS.Red
-            logConsole("Warning", "The project root cannot be renamed here.")
-            return false
-        end
-        if not renameSelectedPath then return false end
-        local typedSuffix = trim(pathBarParts.input.Text)
-        local prefixText = pathBarParts.prefixLabel.Text
-        local projectPrefix = currentProject.name .. " / "
-        local folderPart = ""
-        if string.sub(prefixText, 1, #projectPrefix) == projectPrefix then
-            folderPart = string.sub(prefixText, #projectPrefix + 1)
-            folderPart = folderPart:gsub("%s*/%s*$", "")
-        end
-        local typedPath = typedSuffix
-        if folderPart ~= "" then typedPath = folderPart .. "/" .. typedSuffix end
-        typedPath = typedPath:gsub("%s*/%s*", "/")
-        local renamed, renameError = renameSelectedPath(typedPath, true, true)
-        if not renamed then
-            editorStatus.Text = "Rename failed: " .. tostring(renameError or "Invalid path")
-            editorStatus.TextColor3 = COLORS.Red
-            logConsole("Error", "Path Bar rename failed: " .. tostring(renameError or "Invalid path"))
-            if EditorSession.updateButtons then EditorSession.updateButtons() end
-            return false
-        end
-        if Settings.refreshEditorSyntaxHighlight then
-            Settings.refreshEditorSyntaxHighlight(EditorSession.getCurrentSource())
-        end
-    end
-
-    local source = nil
-    if codeDirty then
-        source = EditorSession.getCurrentSource()
-        syncEditorToFile(currentProject, source)
-    end
-    currentProject.updated = os.time()
-    local saved, message = saveData()
-
-    if codeDirty then
-        EditorSession.committedText = source
-    end
-    EditorSession.committedPath = currentProject.activeFile
-
-    if pathDirty and updatePathBar then
-        updatePathBar()
-    end
-
-    if saved then
-        editorStatus.Text = (codeDirty and "Committed - " or "Path committed - ") .. getProjectSize(currentProject)
-        editorStatus.TextColor3 = COLORS.Green
-        logConsole("Success", "Committed " .. tostring(currentProject.activeFile or currentProject.name))
-    else
-        editorStatus.Text = "Committed to session only"
-        editorStatus.TextColor3 = COLORS.Yellow
-        logConsole("Warning", tostring(message))
-    end
-
-    if EditorSession.updateButtons then EditorSession.updateButtons() end
-    return true
-end
-
-EditorSession.cancel = function()
-    if not currentProject then return false end
-    local originalText = EditorSession.committedText
-
-    if Settings.ProjectNavigation.viewingFile then
-        EditorSession.loading = true
-        if BigCode.shouldUsePreview(originalText) then
-            BigCode.render(originalText)
-            editorBox.Visible = true
-            editorBox.Active = true
-            editorBox.Selectable = true
-            editorBox.TextEditable = true
-        else
-            if BigCode.mode and BigCode.clearMode then BigCode.clearMode() end
-            editorBox.Visible = true
-            editorBox.Active = true
-            editorBox.Selectable = true
-            editorBox.TextEditable = true
-            editorBox.Text = originalText
-            editorBox.TextTransparency = 0
-        end
-    end
-
-    if pathBarParts and pathBarParts.input then
-        pathBarUpdating = true
-        pathBarParts.input.Text = pathBarParts.inputOriginalText or ""
-        pathBarUpdating = false
-        if pathBarParts.updateSize then pathBarParts.updateSize() end
-    end
-
-    if Settings.refreshEditorSyntaxHighlight and Settings.ProjectNavigation.viewingFile then
-        Settings.refreshEditorSyntaxHighlight(originalText)
-    end
-    if measureEditorCanvas and Settings.ProjectNavigation.viewingFile then
-        task.defer(measureEditorCanvas)
-    end
-    if Settings.ProjectNavigation.viewingFile then
-        EditorSession.setBaseline(currentProject.activeFile, originalText)
-    else
-        EditorSession.loading = false
-        if EditorSession.updateButtons then EditorSession.updateButtons() end
-    end
-
-    editorStatus.Text = "Changes discarded"
-    editorStatus.TextColor3 = COLORS.Muted
-    return true
-end
-
-EditorSession.requestNavigation = function(callback)
-    if not EditorSession.hasPendingChanges() then
-        if callback then callback() end
-        return true
-    end
-    if EditorSession.warningWindow then return false end
-
-    local overlay = make("Frame", {
-        Name = "UnsavedChangesOverlay",
-        Size = UDim2.fromScale(1,1),
-        BackgroundColor3 = Color3.fromRGB(0,0,0),
-        BackgroundTransparency = 0.35,
-        BorderSizePixel = 0,
-        ZIndex = 120,
-        Active = true,
-    }, window)
-    EditorSession.warningWindow = overlay
-
-    local pw = math.min(340, windowWidth - 30)
-    local ph = 190
-    local popup = make("Frame", {
-        Size = UDim2.fromOffset(pw,ph),
-        Position = UDim2.new(0.5,-pw/2,0.5,-ph/2),
-        BackgroundColor3 = COLORS.Panel,
-        BorderSizePixel = 0,
-        ZIndex = 121,
-        Active = true,
-    }, overlay)
-    addCorner(popup,10)
-    addStroke(popup,COLORS.Border)
-
-    local title = createLabel(popup,"Unsaved Changes",UDim2.new(1,-24,0,28),UDim2.fromOffset(12,10),15,COLORS.Text,Enum.Font.GothamBold)
-    title.ZIndex = 122
-    local description = createLabel(popup,"You have uncommitted changes. What would you like to do?",UDim2.new(1,-24,0,48),UDim2.fromOffset(12,44),11,COLORS.Muted)
-    description.TextWrapped = true
-    description.TextYAlignment = Enum.TextYAlignment.Top
-    description.ZIndex = 122
-
-    local function closePopup()
-        if EditorSession.warningWindow == overlay then
-            EditorSession.warningWindow = nil
-        end
-        overlay:Destroy()
-    end
-
-    local commitBtn = createButton(popup,"Commit",UDim2.new(1,-24,0,32),UDim2.fromOffset(12,100),function()
-        local ok = EditorSession.commit()
-        if ok then
-            closePopup()
-            if callback then callback() end
-        end
-    end,COLORS.Green)
-    commitBtn.ZIndex = 122
-    local discardBtn = createButton(popup,"Discard",UDim2.fromOffset(100,30),UDim2.fromOffset(12,144),function()
-        EditorSession.cancel()
-        closePopup()
-        if callback then callback() end
-    end,COLORS.Red)
-    discardBtn.ZIndex = 122
-    local stayBtn = createButton(popup,"Stay",UDim2.fromOffset(100,30),UDim2.new(1,-112,0,144),closePopup,COLORS.Panel2)
-    stayBtn.ZIndex = 122
-    return false
-end
-EditorSession.updateButtons()
-
 Settings.actionBarBtnWidth=88
 Settings.actionBarBtnGap=4
 Settings.actionBarBtnCount=7
@@ -2212,6 +1708,24 @@ local function actionButton(text,index,callback,color)
 end
 Settings.actionBarContent.Size=UDim2.fromOffset(Settings.actionBarContentWidth,32)
 actionBar.CanvasSize=UDim2.fromOffset(Settings.actionBarContentWidth,0)
+Settings.saveActionButton = nil
+Settings.updateSaveButtonVisibility = function()
+    local saveActionButton = Settings.saveActionButton
+    if not saveActionButton then return end
+    if Settings.AppSettings.autoSave then
+        saveActionButton.Text = "Auto: ON"
+        saveActionButton.BackgroundColor3 = COLORS.Green
+        saveActionButton.Active = false
+        saveActionButton.AutoButtonColor = false
+        saveActionButton.Selectable = false
+    else
+        saveActionButton.Text = "Save"
+        saveActionButton.BackgroundColor3 = COLORS.Panel2
+        saveActionButton.Active = true
+        saveActionButton.AutoButtonColor = true
+        saveActionButton.Selectable = true
+    end
+end
 local editorMenuButton=actionButton("Editor",0,function()
     if not Settings.ProjectNavigation.editorMenu then return end
     Settings.ProjectNavigation.editorMenu.Visible=not Settings.ProjectNavigation.editorMenu.Visible
@@ -2236,17 +1750,8 @@ runCheckButton=actionButton("Run",3,function()
         openConsole()
         return
     end
-    -- BigCode Source Layer: editorBox.Text always contains the complete document.
-    -- The virtual row labels are display-only and must never be used for validation.
-    local sourceToRun
-    if BigCode and type(BigCode.getSource) == "function" then
-        sourceToRun = BigCode.getSource()
-    elseif BigCode and BigCode.mode then
-        sourceToRun = (editorBox and editorBox.Text) or BigCode.fullText or ""
-    else
-        sourceToRun = editorBox and editorBox.Text or ""
-    end
-    sourceToRun = tostring(sourceToRun or "")
+    local sourceToRun = BigCode.getSource and BigCode.getSource() or (editorBox.Text or "")
+    syncEditorToFile(currentProject,sourceToRun)
     local activePath=currentProject.activeFile or "main.lua"
     local activeFile=getProjectFile(currentProject,activePath)
     local ok,msg,line=validateProjectFile(activeFile,sourceToRun)
@@ -2293,156 +1798,32 @@ fileTreeLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(function(
 Settings.ProjectNavigation.codePanel=make("Frame",{Name="CodePanel",Position=UDim2.fromOffset(Settings.ProjectNavigation.treePanelWidth+14,0),Size=UDim2.new(1,-(Settings.ProjectNavigation.treePanelWidth+21),1,0),BackgroundTransparency=1},editorSurface)
 editorFileLabel=createLabel(Settings.ProjectNavigation.codePanel,"Select a file",UDim2.new(1,-268,0,25),UDim2.fromOffset(3,5),10,COLORS.Muted,Enum.Font.GothamBold)
 Settings.ProjectNavigation.newlineButton=createButton(Settings.ProjectNavigation.codePanel,"Enter",UDim2.fromOffset(48,24),UDim2.new(1,-51,0,5),nil,COLORS.Panel2); Settings.ProjectNavigation.newlineButton.TextSize=10
-local EDITOR_LINE_HEIGHT = 1.05
 local gutterWidth=34
 Settings.ProjectNavigation.gutterBg=make("Frame",{Name="LineNumberGutter",Position=UDim2.fromOffset(3,32),Size=UDim2.new(0,gutterWidth,1,-38),
     BackgroundColor3=COLORS.Panel2,BorderSizePixel=0,ClipsDescendants=true},Settings.ProjectNavigation.codePanel)
 addCorner(Settings.ProjectNavigation.gutterBg,6)
 local gutterLabel=make("TextLabel",{Name="LineNumbers",Position=UDim2.fromOffset(0,6),Size=UDim2.fromOffset(gutterWidth,220),
     BackgroundTransparency=1,BorderSizePixel=0,Text="1",TextColor3=COLORS.Muted,TextSize=compact and 11 or 13,
-    Font=Enum.Font.Code,LineHeight=EDITOR_LINE_HEIGHT,TextXAlignment=Enum.TextXAlignment.Right,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false},Settings.ProjectNavigation.gutterBg)
+    Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Right,TextYAlignment=Enum.TextYAlignment.Top,TextWrapped=false},Settings.ProjectNavigation.gutterBg)
 editorViewport=make("ScrollingFrame",{Name="CodeViewport",Position=UDim2.fromOffset(gutterWidth+3,32),Size=UDim2.new(1,-(gutterWidth+6),1,-38),BackgroundColor3=COLORS.Panel,
     BorderSizePixel=0,ClipsDescendants=true,ScrollBarThickness=compact and 5 or 7,ScrollBarImageColor3=COLORS.Muted,
     ScrollingDirection=Enum.ScrollingDirection.XY,CanvasSize=UDim2.fromOffset(0,0),Active=true},Settings.ProjectNavigation.codePanel)
 addCorner(editorViewport,6)
-editorBox=make("TextBox",{
-    Name="CodeEditor",
-    Position=UDim2.fromOffset(8,6),
-    Size=UDim2.fromOffset(320,220),
-    BackgroundTransparency=1,
-    BorderSizePixel=0,
-    Text="",
-    PlaceholderText="-- Start writing Luau code here...",
-    PlaceholderColor3=COLORS.Muted,
-    TextColor3=COLORS.Text,
-    TextSize=compact and 11 or 13,
-    Font=Enum.Font.Code,
-    LineHeight=EDITOR_LINE_HEIGHT,
-    TextXAlignment=Enum.TextXAlignment.Left,
-    TextYAlignment=Enum.TextYAlignment.Top,
-    TextWrapped=false,
-    MultiLine=true,
-    ClearTextOnFocus=false,
-    Active=true,
-    Selectable=true,
-    TextEditable=false,
-    ZIndex=3,
-},editorViewport)
-editorBox.ZIndex = 3
-editorHighlightLabel = make("TextLabel", {
-    Name = "SyntaxHighlightLayer",
-    Position = editorBox.Position,
-    Size = editorBox.Size,
-    BackgroundTransparency = 1,
-    BorderSizePixel = 0,
-    Text = "",
-    TextColor3 = COLORS.Text,
-    TextSize = editorBox.TextSize,
-    Font = Enum.Font.Code,
-    LineHeight = EDITOR_LINE_HEIGHT,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top,
-    TextWrapped = false,
-    TextScaled = false,
-    RichText = true,
-    Active = false,
-    Selectable = false,
-    ZIndex = 2,
-}, editorViewport)
-
-local function refreshEditorSyntaxHighlight(source)
-    if not editorBox or not editorHighlightLabel then return end
-    source = tostring(source or "")
-
-    editorHighlightLabel.Position = editorBox.Position
-    editorHighlightLabel.Size = editorBox.Size
-    editorHighlightLabel.TextSize = editorBox.TextSize
-
-    if BigCode.mode then
-        editorHighlightLabel.Text = ""
-        editorHighlightLabel.Visible = false
-        editorBox.TextTransparency = 1
-        return
-    end
-
-    local activePath = currentProject and currentProject.activeFile or ""
-    local shouldHighlight = isScriptFile(activePath) and source ~= ""
-
-    if shouldHighlight then
-        local richText = SyntaxHighlight.highlightLua(source)
-        editorHighlightLabel.Text = richText
-        editorHighlightLabel.Visible = editorBox.Visible
-        editorBox.TextTransparency = 1
-    else
-        editorHighlightLabel.Text = ""
-        editorHighlightLabel.Visible = false
-        editorBox.TextTransparency = 0
-    end
-end
-
-Settings.refreshEditorSyntaxHighlight = refreshEditorSyntaxHighlight
-editorBox:GetPropertyChangedSignal("Visible"):Connect(function()
-    if editorHighlightLabel then
-        local activePath = currentProject and currentProject.activeFile or ""
-        editorHighlightLabel.Visible = editorBox.Visible and isScriptFile(activePath)
-            and (editorBox.Text or "") ~= "" and not BigCode.mode
-    end
-end)
-
+editorBox=make("TextBox",{Name="CodeEditor",Position=UDim2.fromOffset(8,6),Size=UDim2.fromOffset(320,220),BackgroundTransparency=1,BorderSizePixel=0,
+    Text="",PlaceholderText="-- Start writing Luau code here...",PlaceholderColor3=COLORS.Muted,TextColor3=COLORS.Text,
+    TextSize=compact and 11 or 13,Font=Enum.Font.Code,LineHeight=1.3,TextXAlignment=Enum.TextXAlignment.Left,TextYAlignment=Enum.TextYAlignment.Top,
+    TextWrapped=false,MultiLine=true,ClearTextOnFocus=false,Active=true},editorViewport)
 editorStatus=createLabel(editorPage,"Ready",UDim2.new(1,-24,0,22),UDim2.new(0,12,1,-27),10,COLORS.Muted)
 local lastEditorCursor=1; local lastEditorSelection=1
 local function rememberCaret()
     if editorBox.CursorPosition and editorBox.CursorPosition>=1 then lastEditorCursor=editorBox.CursorPosition end
     if editorBox.SelectionStart and editorBox.SelectionStart>=1 then lastEditorSelection=editorBox.SelectionStart end
-    if BigCode.mode and BigCode.updateCaretAndSelection then
-        BigCode.updateCaretAndSelection()
-    end
 end
 editorBox:GetPropertyChangedSignal("CursorPosition"):Connect(rememberCaret)
 editorBox:GetPropertyChangedSignal("SelectionStart"):Connect(rememberCaret)
-editorBox.Focused:Connect(function()
-    rememberCaret()
-    if BigCode.mode then
-        BigCode.focusedEditor = editorBox
-        BigCode.focusedChunkIndex = nil
-        if BigCode.updateCaretAndSelection then BigCode.updateCaretAndSelection() end
-    end
-end)
-editorBox.FocusLost:Connect(function()
-    if BigCode.mode and BigCode.focusedEditor == editorBox then
-        BigCode.focusedEditor = nil
-        BigCode.focusedChunkIndex = nil
-        if BigCode.recalculateMaxWidth then BigCode.recalculateMaxWidth() end
-        if BigCode.updateCaretAndSelection then BigCode.updateCaretAndSelection() end
-    end
-end)
-editorBox.InputBegan:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.MouseButton1
-        and input.UserInputType ~= Enum.UserInputType.Touch then
-        return
-    end
-    if not editorBox.Visible or not editorBox.TextEditable then
-        return
-    end
-    task.defer(function()
-        if not editorBox or not editorBox.Parent or not editorBox.Visible or not editorBox.TextEditable then
-            return
-        end
-        if not editorBox:IsFocused() then
-            editorBox:CaptureFocus()
-        end
-        if BigCode.mode and editorBox:IsFocused() then
-            BigCode.focusedEditor = editorBox
-            BigCode.focusedChunkIndex = nil
-            if BigCode.updateCaretAndSelection then BigCode.updateCaretAndSelection() end
-        end
-    end)
-end)
-measureEditorCanvas = function()
-    if BigCode.mode then
-        if BigCode.refreshLayout then BigCode.refreshLayout(true) end
-        return
-    end
+editorBox.Focused:Connect(rememberCaret)
+local function measureEditorCanvas()
+    if BigCode.mode and editorBox and not editorBox.Visible then return end
     if not editorBox or not editorBox.Parent or not editorViewport then return end
     local visibleSize = editorViewport.AbsoluteSize
     if visibleSize.X <= 0 or visibleSize.Y <= 0 then return end
@@ -2450,7 +1831,7 @@ measureEditorCanvas = function()
     local textSize = editorBox.TextSize
     local font = editorBox.Font
     local lineSample = TextService:GetTextSize("Ag", textSize, font, Vector2.new(100000, 100000))
-    local lineHeight = math.max(textSize + 1, lineSample.Y * EDITOR_LINE_HEIGHT)
+    local lineHeight = math.max(textSize + 2, lineSample.Y * 1.3)
     local lineCount = 0
     local maximumLineWidth = 0
     for line in (source .. "\n"):gmatch("(.-)\n") do
@@ -2469,10 +1850,6 @@ measureEditorCanvas = function()
         math.ceil(lineCount * lineHeight + 24)
     )
     editorBox.Size = UDim2.fromOffset(editorWidth, editorHeight)
-    if editorHighlightLabel then
-        editorHighlightLabel.Position = editorBox.Position
-        editorHighlightLabel.Size = editorBox.Size
-    end
     editorViewport.CanvasSize = UDim2.fromOffset(editorWidth + 16, editorHeight + 12)
     local lineNumbers = {}
     local firstLine = 1
@@ -2494,7 +1871,7 @@ local function keepEditorCaretVisible()
     local lp=string.sub(bc,lastB+1)
     local pb=TextService:GetTextSize(lp~="" and lp or " ",editorBox.TextSize,editorBox.Font,Vector2.new(100000,100000))
     local lb=TextService:GetTextSize("Ag",editorBox.TextSize,editorBox.Font,Vector2.new(100000,100000))
-    local lh=math.max(editorBox.TextSize + 1,lb.Y*EDITOR_LINE_HEIGHT); local cx=8+(lp=="" and 0 or pb.X); local cy=6+(ln-1)*lh
+    local lh=math.max(1,lb.Y*1.3); local cx=8+(lp=="" and 0 or pb.X); local cy=6+(ln-1)*lh
     local view=editorViewport.AbsoluteSize; local current=editorViewport.CanvasPosition
     local margin=16; local nx=current.X; local ny=current.Y; local cw=7
     if cx<current.X+margin then nx=math.max(0,cx-margin) elseif cx+cw>current.X+view.X-margin then nx=cx+cw-view.X+margin end
@@ -2616,7 +1993,7 @@ BigCode.createVirtualPool = function()
         slot.TextColor3 = COLORS.Text
         slot.TextSize = editorBox.TextSize
         slot.Font = Enum.Font.Code
-        slot.LineHeight = EDITOR_LINE_HEIGHT
+        slot.LineHeight = 1.3
         slot.TextXAlignment = Enum.TextXAlignment.Left
         slot.TextYAlignment = Enum.TextYAlignment.Top
         slot.TextWrapped = false
@@ -2628,35 +2005,11 @@ BigCode.createVirtualPool = function()
         slot.ClearTextOnFocus = false
         slot.TextEditable = true
         slot.Active = true
-        slot.Selectable = true
         slot.Visible = false
-        slot.ZIndex = 3
+        slot.ZIndex = editorBox.ZIndex
         slot.Parent = editorViewport
         BigCode.virtualSlots[slotIndex] = slot
         BigCode.slotChunkIndices[slotIndex] = nil
-
-        local syntaxLabel = Instance.new("TextLabel")
-        syntaxLabel.Name = "BigCodeSyntaxHighlight_" .. tostring(slotIndex)
-        syntaxLabel.BackgroundTransparency = 1
-        syntaxLabel.BorderSizePixel = 0
-        syntaxLabel.Position = slot.Position
-        syntaxLabel.Size = slot.Size
-        syntaxLabel.Text = ""
-        syntaxLabel.TextColor3 = COLORS.Text
-        syntaxLabel.TextSize = slot.TextSize
-        syntaxLabel.Font = Enum.Font.Code
-        syntaxLabel.LineHeight = EDITOR_LINE_HEIGHT
-        syntaxLabel.TextXAlignment = Enum.TextXAlignment.Left
-        syntaxLabel.TextYAlignment = Enum.TextYAlignment.Top
-        syntaxLabel.TextWrapped = false
-        syntaxLabel.TextScaled = false
-        syntaxLabel.RichText = true
-        syntaxLabel.ZIndex = 2
-        syntaxLabel.Active = false
-        syntaxLabel.Selectable = false
-        syntaxLabel.Visible = false
-        syntaxLabel.Parent = editorViewport
-        BigCode.virtualHighlightSlots[slotIndex] = syntaxLabel
         local numberLabel = Instance.new("TextLabel")
         numberLabel.Name = "BigCodeVirtualGutter_" .. tostring(slotIndex)
         numberLabel.BackgroundTransparency = 1
@@ -2670,7 +2023,7 @@ BigCode.createVirtualPool = function()
         numberLabel.TextYAlignment = Enum.TextYAlignment.Top
         numberLabel.TextWrapped = false
         numberLabel.TextScaled = false
-        numberLabel.LineHeight = EDITOR_LINE_HEIGHT
+        numberLabel.LineHeight = 1.3
         numberLabel.Text = ""
         numberLabel.Visible = false
         numberLabel.ZIndex = gutterLabel.ZIndex
@@ -2703,51 +2056,24 @@ BigCode.createVirtualPool = function()
                         break
                     end
                 end
-                if EditorSession.updateButtons then EditorSession.updateButtons() end
+                if currentProject then syncEditorToFile(currentProject, BigCode.fullText) end
+                Settings.debouncedAutoSave()
                 return
             end
             BigCode.chunks[globalIndex] = slot.Text or ""
-            BigCode.rebuildSyntaxStates(globalIndex)
-            BigCode.refreshSlotSyntaxHighlight(slotIndex)
             local _, newlineCount = (slot.Text or ""):gsub("\n", "")
             if #(slot.Text or "") > 4000 or newlineCount + 1 > 80 then
                 BigCode.queueRechunk(slotIndex, globalIndex)
             else
                 BigCode.refreshLayout(true, globalIndex)
             end
-            if EditorSession.updateButtons then EditorSession.updateButtons() end
+            Settings.debouncedAutoSave()
         end)
         slot.InputBegan:Connect(function(input)
-            if input.UserInputType ~= Enum.UserInputType.MouseButton1
-                and input.UserInputType ~= Enum.UserInputType.Touch then
-                return
+            if input.UserInputType == Enum.UserInputType.MouseButton1
+                or input.UserInputType == Enum.UserInputType.Touch then
+                if BigCode.selectAll then BigCode.selectAll = false end
             end
-
-            if not BigCode.mode or not slot.Visible or not slot.TextEditable then
-                return
-            end
-
-            if BigCode.selectAll then
-                BigCode.selectAll = false
-            end
-
-            task.defer(function()
-                if not BigCode.mode
-                    or not slot.Parent
-                    or not slot.Visible
-                    or not slot.TextEditable then
-                    return
-                end
-
-                if not slot:IsFocused() then
-                    slot:CaptureFocus()
-                end
-
-                if slot:IsFocused() then
-                    BigCode.focusedEditor = slot
-                    BigCode.focusedChunkIndex = BigCode.slotChunkIndices[slotIndex]
-                end
-            end)
         end)
         slot.Focused:Connect(function()
             if not BigCode.mode then return end
@@ -2763,7 +2089,9 @@ BigCode.createVirtualPool = function()
             if globalIndex then
                 BigCode.chunks[globalIndex] = slot.Text or ""
                 BigCode.recalculateLineStarts()
-                if EditorSession.updateButtons then EditorSession.updateButtons() end
+                if currentProject then
+                    syncEditorToFile(currentProject, BigCode.fullText)
+                end
             end
             if BigCode.focusedEditor == slot then
                 BigCode.focusedEditor = nil
@@ -2772,65 +2100,6 @@ BigCode.createVirtualPool = function()
         end)
     end
 end
-
-BigCode.refreshSlotSyntaxHighlight = function(slotIndex)
-    local slot = BigCode.virtualSlots[slotIndex]
-    local label = BigCode.virtualHighlightSlots[slotIndex]
-    if not slot or not label then return end
-
-    local activePath = currentProject and currentProject.activeFile or ""
-    local source = slot.Text or ""
-    local shouldHighlight = isScriptFile(activePath) and source ~= ""
-
-    label.Position = slot.Position
-    label.Size = slot.Size
-    label.TextSize = slot.TextSize
-    label.Visible = slot.Visible and shouldHighlight
-
-    if shouldHighlight then
-        local globalIndex = BigCode.slotChunkIndices[slotIndex]
-        local initialState = globalIndex and BigCode.chunkSyntaxStartStates[globalIndex]
-        label.Text = SyntaxHighlight.highlightLua(source, initialState)
-        slot.TextTransparency = 1
-    else
-        label.Text = ""
-        slot.TextTransparency = 0
-    end
-end
-
-BigCode.rebuildSyntaxStates = function(fromIndex)
-    fromIndex = math.max(1, tonumber(fromIndex) or 1)
-    local state = fromIndex > 1 and BigCode.chunkSyntaxEndStates[fromIndex - 1] or nil
-
-    local function sameState(a, b)
-        if a == nil or b == nil then return a == b end
-        return a.mode == b.mode
-            and a.equals == b.equals
-            and a.quote == b.quote
-            and a.escaped == b.escaped
-            and a.previousSignificant == b.previousSignificant
-    end
-
-    for index = fromIndex, #BigCode.chunks do
-        local previousEndState = BigCode.chunkSyntaxEndStates[index]
-        BigCode.chunkSyntaxStartStates[index] = state
-        local _, nextState = SyntaxHighlight.highlightLua(BigCode.chunks[index] or "", state, true)
-        BigCode.chunkSyntaxEndStates[index] = nextState
-        state = nextState
-        -- If the outgoing lexical state is unchanged, later chunks keep the
-        -- same incoming state, so avoid rescanning the rest of a huge file.
-        if previousEndState and sameState(previousEndState, nextState) then
-            break
-        end
-    end
-
-    for slotIndex, slot in ipairs(BigCode.virtualSlots or {}) do
-        if slot and slot.Visible then
-            BigCode.refreshSlotSyntaxHighlight(slotIndex)
-        end
-    end
-end
-
 BigCode.updateVirtualScroll = function()
     if not BigCode.mode or not editorViewport or #BigCode.virtualSlots == 0 then return end
     local scrollY = editorViewport.CanvasPosition.Y
@@ -2841,11 +2110,6 @@ BigCode.updateVirtualScroll = function()
     if chunkCount == 0 then
         for slotIndex, slot in ipairs(BigCode.virtualSlots) do
             slot.Visible = false
-            slot.TextTransparency = 0
-            if BigCode.virtualHighlightSlots[slotIndex] then
-                BigCode.virtualHighlightSlots[slotIndex].Visible = false
-                BigCode.virtualHighlightSlots[slotIndex].Text = ""
-            end
             BigCode.virtualGutterSlots[slotIndex].Visible = false
             BigCode.slotChunkIndices[slotIndex] = nil
         end
@@ -2910,10 +2174,6 @@ BigCode.updateVirtualScroll = function()
             end
             BigCode.slotChunkIndices[slotIndex] = nil
             slot.Visible = false
-            slot.TextTransparency = 0
-            if BigCode.virtualHighlightSlots[slotIndex] then
-                BigCode.virtualHighlightSlots[slotIndex].Visible = false
-            end
             BigCode.virtualGutterSlots[slotIndex].Visible = false
         end
     end
@@ -2950,11 +2210,7 @@ BigCode.updateVirtualScroll = function()
             slot.Position = UDim2.fromOffset(8, offset)
             slot.Size = UDim2.fromOffset(width, height)
             slot.Visible = true
-            slot.Active = true
-            slot.Selectable = true
             slot.TextEditable = true
-            slot.ZIndex = 3
-            BigCode.refreshSlotSyntaxHighlight(slotIndex)
             if BigCode.selectAll then
                 slot.SelectionStart = 1
                 slot.CursorPosition = #(slot.Text or "") + 1
@@ -2980,10 +2236,6 @@ BigCode.updateVirtualScroll = function()
             numberLabel.Visible = true
         else
             slot.Visible = false
-            slot.TextTransparency = 0
-            if BigCode.virtualHighlightSlots[slotIndex] then
-                BigCode.virtualHighlightSlots[slotIndex].Visible = false
-            end
             numberLabel.Visible = false
         end
     end
@@ -2997,7 +2249,7 @@ BigCode.refreshLayout = function(skipHarvest, changedIndex)
     BigCode.recalculateLineStarts()
     local textSize = editorBox.TextSize
     local sample = TextService:GetTextSize("Ag", textSize, Enum.Font.Code, Vector2.new(100000, 100000))
-    local lineHeight = math.max(textSize + 1, sample.Y * EDITOR_LINE_HEIGHT)
+    local lineHeight = math.max(textSize + 2, sample.Y * 1.3)
     local maxWidth = math.max(100, view.X - 16)
     local yOffset = 6
     BigCode.chunkOffsets = {}
@@ -3052,9 +2304,6 @@ BigCode.queueRechunk = function(slotIndex, globalIndex)
         BigCode.rebuilding = true
         BigCode.chunks = newChunks
         BigCode.chunkStartLines = newStarts
-        BigCode.chunkSyntaxStartStates = {}
-        BigCode.chunkSyntaxEndStates = {}
-        BigCode.rebuildSyntaxStates(1)
         BigCode.chunkOffsets = {}
         BigCode.chunkHeights = {}
         BigCode.chunkWidths = {}
@@ -3064,11 +2313,6 @@ BigCode.queueRechunk = function(slotIndex, globalIndex)
             if virtualSlot:IsFocused() then virtualSlot:ReleaseFocus() end
             virtualSlot.Text = ""
             virtualSlot.Visible = false
-            virtualSlot.TextTransparency = 0
-            if BigCode.virtualHighlightSlots[index] then
-                BigCode.virtualHighlightSlots[index].Text = ""
-                BigCode.virtualHighlightSlots[index].Visible = false
-            end
             BigCode.virtualGutterSlots[index].Text = ""
             BigCode.virtualGutterSlots[index].Visible = false
         end
@@ -3104,6 +2348,7 @@ BigCode.queueRechunk = function(slotIndex, globalIndex)
                 break
             end
         end
+        if currentProject then syncEditorToFile(currentProject, BigCode.fullText) end
     end)
 end
 BigCode.render = function(fullText, restoreCanvasPosition, preferredChunkIndex)
@@ -3113,9 +2358,6 @@ BigCode.render = function(fullText, restoreCanvasPosition, preferredChunkIndex)
     BigCode.selectAll = false
     BigCode.fullText = fullText
     BigCode.chunks, BigCode.chunkStartLines = BigCode.splitChunks(fullText)
-    BigCode.chunkSyntaxStartStates = {}
-    BigCode.chunkSyntaxEndStates = {}
-    BigCode.rebuildSyntaxStates(1)
     BigCode.chunkOffsets = {}
     BigCode.chunkHeights = {}
     BigCode.chunkWidths = {}
@@ -3124,13 +2366,7 @@ BigCode.render = function(fullText, restoreCanvasPosition, preferredChunkIndex)
     BigCode.focusedChunkIndex = nil
     BigCode.createVirtualPool()
     local keepSlots = {}
-    for _, slot in ipairs(BigCode.virtualSlots) do
-        keepSlots[slot] = true
-    end
-    for _, label in ipairs(BigCode.virtualHighlightSlots) do
-        keepSlots[label] = true
-    end
-    keepSlots[editorHighlightLabel] = true
+    for _, slot in ipairs(BigCode.virtualSlots) do keepSlots[slot] = true end
     for _, child in ipairs(editorViewport:GetChildren()) do
         if child ~= editorBox and not keepSlots[child] then
             child:Destroy()
@@ -3147,19 +2383,12 @@ BigCode.render = function(fullText, restoreCanvasPosition, preferredChunkIndex)
         if slot:IsFocused() then slot:ReleaseFocus() end
         slot.Text = ""
         slot.Visible = false
-        slot.TextTransparency = 0
-        if BigCode.virtualHighlightSlots[slotIndex] then
-            BigCode.virtualHighlightSlots[slotIndex].Text = ""
-            BigCode.virtualHighlightSlots[slotIndex].Visible = false
-        end
         BigCode.virtualGutterSlots[slotIndex].Text = ""
         BigCode.virtualGutterSlots[slotIndex].Visible = false
         BigCode.slotChunkIndices[slotIndex] = nil
     end
     editorBox.Visible = false
     editorBox.TextEditable = false
-    editorBox.TextTransparency = 0
-    if editorHighlightLabel then editorHighlightLabel.Visible = false end
     editorBox.Position = UDim2.fromOffset(8, 6)
     editorBox.Size = UDim2.fromOffset(0, 0)
     gutterLabel.Visible = false
@@ -3186,8 +2415,6 @@ BigCode.clearMode = function()
     BigCode.chunkOffsets = {}
     BigCode.chunkHeights = {}
     BigCode.chunkWidths = {}
-    BigCode.chunkSyntaxStartStates = {}
-    BigCode.chunkSyntaxEndStates = {}
     BigCode.totalLines = 1
     BigCode.totalHeight = 0
     BigCode.pendingRechunk = false
@@ -3201,15 +2428,11 @@ BigCode.clearMode = function()
     for _, label in ipairs(BigCode.virtualGutterSlots or {}) do
         if label and label.Parent then label:Destroy() end
     end
-    for _, label in ipairs(BigCode.virtualHighlightSlots or {}) do
-        if label and label.Parent then label:Destroy() end
-    end
     BigCode.virtualSlots = {}
     BigCode.virtualGutterSlots = {}
-    BigCode.virtualHighlightSlots = {}
     if editorViewport then
         for _, child in ipairs(editorViewport:GetChildren()) do
-            if child ~= editorBox and child ~= editorHighlightLabel then child:Destroy() end
+            if child ~= editorBox then child:Destroy() end
         end
         editorViewport.CanvasSize = UDim2.fromOffset(0, 0)
         editorViewport.CanvasPosition = Vector2.new(0, 0)
@@ -3226,16 +2449,8 @@ BigCode.clearMode = function()
     if editorBox then
         editorBox.Visible = true
         editorBox.TextEditable = true
-        editorBox.TextTransparency = 0
         editorBox.Position = UDim2.fromOffset(8, 6)
         editorBox.Size = UDim2.fromOffset(320, 220)
-    end
-    if editorHighlightLabel then
-        editorHighlightLabel.Position = editorBox.Position
-        editorHighlightLabel.Size = editorBox.Size
-    end
-    if Settings.refreshEditorSyntaxHighlight then
-        Settings.refreshEditorSyntaxHighlight(editorBox and editorBox.Text or "")
     end
     if measureEditorCanvas then task.defer(measureEditorCanvas) end
 end
@@ -3279,8 +2494,8 @@ BigCode.focusLine = function(targetLine)
             break
         end
     end
-    local lineHeight = math.max(editorBox.TextSize + 1,
-        TextService:GetTextSize("Ag", editorBox.TextSize, Enum.Font.Code, Vector2.new(100000, 100000)).Y * EDITOR_LINE_HEIGHT)
+    local lineHeight = math.max(editorBox.TextSize + 2,
+        TextService:GetTextSize("Ag", editorBox.TextSize, Enum.Font.Code, Vector2.new(100000, 100000)).Y * 1.3)
     local targetY = (BigCode.chunkOffsets[selectedIndex] or 6) + (localLine - 1) * lineHeight
     local current = editorViewport.CanvasPosition
     editorViewport.CanvasPosition = Vector2.new(current.X, math.max(0, targetY - 12))
@@ -3306,681 +2521,6 @@ BigCode.focusLine = function(targetLine)
     BigCode.focusedChunkIndex = selectedIndex
     return true
 end
---[[
-    BigCode row virtualization.
-    The full source remains in one native multiline TextBox so Roblox continues
-    to provide cross-line selection, keyboard editing, clipboard and undo.
-    Only visible syntax rows, gutter rows and selection overlays are pooled.
-]]
-do
-    local function splitSourceLines(source)
-        local lines = {}
-        local startPos = 1
-        while true do
-            local newlinePos = string.find(source, "\n", startPos, true)
-            if not newlinePos then
-                lines[#lines + 1] = string.sub(source, startPos)
-                break
-            end
-            lines[#lines + 1] = string.sub(source, startPos, newlinePos - 1)
-            startPos = newlinePos + 1
-        end
-        if #lines == 0 then lines[1] = "" end
-        return lines
-    end
-
-    local function sameSyntaxState(a, b)
-        if a == nil or b == nil then return a == b end
-        return a.mode == b.mode
-            and a.equals == b.equals
-            and a.quote == b.quote
-            and a.escaped == b.escaped
-            and a.previousSignificant == b.previousSignificant
-    end
-
-    local function measureTextWidth(text)
-        if text == nil or text == "" then return 0 end
-        local bounds = TextService:GetTextSize(
-            text,
-            editorBox.TextSize,
-            editorBox.Font,
-            Vector2.new(100000, 100000)
-        )
-        return bounds.X
-    end
-
-    BigCode.createVirtualPool = function()
-        -- Keep one real input surface; virtual slots are display-only rows.
-        for _, oldSlot in ipairs(BigCode.virtualSlots or {}) do
-            if oldSlot and oldSlot ~= editorBox and oldSlot.Parent then
-                oldSlot:Destroy()
-            end
-        end
-        BigCode.virtualSlots = { editorBox }
-        BigCode.slotChunkIndices = { [1] = 1 }
-        BigCode.virtualHighlightSlots = BigCode.virtualHighlightSlots or {}
-        BigCode.virtualGutterSlots = BigCode.virtualGutterSlots or {}
-        BigCode.virtualSelectionSlots = BigCode.virtualSelectionSlots or {}
-        BigCode.linePoolIndices = BigCode.linePoolIndices or {}
-        editorBox.Visible = true
-        editorBox.Active = true
-        editorBox.Selectable = true
-        editorBox.TextEditable = true
-        editorBox.TextWrapped = false
-        editorBox.LineHeight = EDITOR_LINE_HEIGHT
-        editorBox.ZIndex = 3
-        editorBox.TextTransparency = 1
-        if editorHighlightLabel then editorHighlightLabel.Visible = false end
-        if gutterLabel then
-            gutterLabel.Visible = false
-            gutterLabel.Text = ""
-        end
-    end
-
-    BigCode.ensureLinePool = function(requiredCount)
-        requiredCount = math.max(1, math.floor(tonumber(requiredCount) or 1))
-        while #BigCode.virtualHighlightSlots < requiredCount do
-            local slotIndex = #BigCode.virtualHighlightSlots + 1
-            local syntaxLabel = Instance.new("TextLabel")
-            syntaxLabel.Name = "BigCodeVirtualLine_" .. tostring(slotIndex)
-            syntaxLabel.BackgroundTransparency = 1
-            syntaxLabel.BorderSizePixel = 0
-            syntaxLabel.Position = UDim2.fromOffset(8, 6)
-            syntaxLabel.Size = UDim2.fromOffset(320, 20)
-            syntaxLabel.Text = ""
-            syntaxLabel.TextColor3 = COLORS.Text
-            syntaxLabel.TextSize = editorBox.TextSize
-            syntaxLabel.Font = Enum.Font.Code
-            syntaxLabel.LineHeight = EDITOR_LINE_HEIGHT
-            syntaxLabel.TextXAlignment = Enum.TextXAlignment.Left
-            syntaxLabel.TextYAlignment = Enum.TextYAlignment.Top
-            syntaxLabel.TextWrapped = false
-            syntaxLabel.TextScaled = false
-            syntaxLabel.TextTruncate = Enum.TextTruncate.None
-            syntaxLabel.RichText = true
-            syntaxLabel.Active = false
-            syntaxLabel.Selectable = false
-            syntaxLabel.Visible = false
-            syntaxLabel.ZIndex = 2
-            syntaxLabel.Parent = editorViewport
-            BigCode.virtualHighlightSlots[slotIndex] = syntaxLabel
-
-            local numberLabel = Instance.new("TextLabel")
-            numberLabel.Name = "BigCodeVirtualLineNumber_" .. tostring(slotIndex)
-            numberLabel.BackgroundTransparency = 1
-            numberLabel.BorderSizePixel = 0
-            numberLabel.Position = UDim2.fromOffset(0, 6)
-            numberLabel.Size = UDim2.fromOffset(gutterWidth, 20)
-            numberLabel.Text = ""
-            numberLabel.TextColor3 = COLORS.Muted
-            numberLabel.TextSize = gutterLabel.TextSize
-            numberLabel.Font = Enum.Font.Code
-            numberLabel.LineHeight = EDITOR_LINE_HEIGHT
-            numberLabel.TextXAlignment = Enum.TextXAlignment.Right
-            numberLabel.TextYAlignment = Enum.TextYAlignment.Top
-            numberLabel.TextWrapped = false
-            numberLabel.TextScaled = false
-            numberLabel.Active = false
-            numberLabel.Selectable = false
-            numberLabel.Visible = false
-            numberLabel.ZIndex = gutterLabel.ZIndex + 1
-            numberLabel.Parent = Settings.ProjectNavigation.gutterBg
-            BigCode.virtualGutterSlots[slotIndex] = numberLabel
-
-            local selectionFrame = Instance.new("Frame")
-            selectionFrame.Name = "BigCodeVirtualSelection_" .. tostring(slotIndex)
-            selectionFrame.BackgroundColor3 = COLORS.Accent
-            selectionFrame.BackgroundTransparency = 0.58
-            selectionFrame.BorderSizePixel = 0
-            selectionFrame.Position = UDim2.fromOffset(8, 6)
-            selectionFrame.Size = UDim2.fromOffset(1, 20)
-            selectionFrame.Visible = false
-            selectionFrame.Active = false
-            selectionFrame.Selectable = false
-            selectionFrame.ZIndex = 2
-            selectionFrame.Parent = editorViewport
-            BigCode.virtualSelectionSlots[slotIndex] = selectionFrame
-            BigCode.linePoolIndices[slotIndex] = nil
-        end
-
-        while #BigCode.virtualHighlightSlots > requiredCount do
-            local slotIndex = #BigCode.virtualHighlightSlots
-            local label = table.remove(BigCode.virtualHighlightSlots)
-            local numberLabel = table.remove(BigCode.virtualGutterSlots)
-            local selectionFrame = table.remove(BigCode.virtualSelectionSlots)
-            if label and label.Parent then label:Destroy() end
-            if numberLabel and numberLabel.Parent then numberLabel:Destroy() end
-            if selectionFrame and selectionFrame.Parent then selectionFrame:Destroy() end
-            BigCode.linePoolIndices[slotIndex] = nil
-        end
-
-        if not BigCode.caretFrame or not BigCode.caretFrame.Parent then
-            local caret = Instance.new("Frame")
-            caret.Name = "BigCodeVirtualCaret"
-            caret.BackgroundColor3 = COLORS.Text
-            caret.BorderSizePixel = 0
-            caret.Position = UDim2.fromOffset(8, 6)
-            caret.Size = UDim2.fromOffset(1, BigCode.lineHeight > 0 and BigCode.lineHeight or 20)
-            caret.Visible = false
-            caret.Active = false
-            caret.Selectable = false
-            caret.ZIndex = 4
-            caret.Parent = editorViewport
-            BigCode.caretFrame = caret
-        end
-    end
-
-    BigCode.recalculateLineStarts = function()
-        local source = editorBox and editorBox.Text or BigCode.fullText or ""
-        BigCode.fullText = source
-        BigCode.chunks = { source }
-        BigCode.chunkStartLines = { 1 }
-        BigCode.chunkOffsets = { 6 }
-        BigCode.chunkHeights = { BigCode.totalHeight or 0 }
-        BigCode.chunkWidths = { math.max(100, BigCode.lineMaxWidth or 0) }
-        BigCode.totalLines = math.max(1, #BigCode.lines)
-        BigCode.lineByteStarts = {}
-        local bytePosition = 1
-        for lineIndex, line in ipairs(BigCode.lines) do
-            BigCode.lineByteStarts[lineIndex] = bytePosition
-            bytePosition = bytePosition + #line + 1
-        end
-    end
-
-    BigCode.rebuildSyntaxStates = function(fromLine, oldLines, oldStartStates, oldEndStates)
-        fromLine = math.max(1, math.floor(tonumber(fromLine) or 1))
-        local newLines = BigCode.lines or { "" }
-        oldLines = oldLines or {}
-        oldStartStates = oldStartStates or {}
-        oldEndStates = oldEndStates or {}
-
-        local prefixCount = 0
-        local prefixLimit = math.min(#oldLines, #newLines)
-        while prefixCount < prefixLimit
-            and oldLines[prefixCount + 1] == newLines[prefixCount + 1] do
-            prefixCount = prefixCount + 1
-        end
-
-        local suffixCount = 0
-        local oldTail = #oldLines
-        local newTail = #newLines
-        while oldTail > prefixCount and newTail > prefixCount
-            and oldLines[oldTail] == newLines[newTail] do
-            suffixCount = suffixCount + 1
-            oldTail = oldTail - 1
-            newTail = newTail - 1
-        end
-
-        local newSuffixStart = #newLines - suffixCount + 1
-        local oldSuffixStart = #oldLines - suffixCount + 1
-        local starts = {}
-        local ends = {}
-        for index = 1, prefixCount do
-            starts[index] = oldStartStates[index]
-            ends[index] = oldEndStates[index]
-        end
-
-        local state = prefixCount > 0 and oldEndStates[prefixCount] or nil
-        local firstToProcess = math.max(prefixCount + 1, math.min(fromLine, #newLines))
-        if firstToProcess > prefixCount + 1 then
-            firstToProcess = prefixCount + 1
-        end
-
-        for index = firstToProcess, #newLines do
-            starts[index] = state
-            local _, nextState = SyntaxHighlight.highlightLua((newLines[index] or "") .. "\n", state, true)
-            ends[index] = nextState
-            state = nextState
-
-            if suffixCount > 0 and index >= newSuffixStart then
-                local oldIndex = oldSuffixStart + (index - newSuffixStart)
-                if oldLines[oldIndex] == newLines[index]
-                    and sameSyntaxState(nextState, oldEndStates[oldIndex]) then
-                    for copyIndex = index + 1, #newLines do
-                        local mappedOldIndex = oldSuffixStart + (copyIndex - newSuffixStart)
-                        starts[copyIndex] = oldStartStates[mappedOldIndex]
-                        ends[copyIndex] = oldEndStates[mappedOldIndex]
-                    end
-                    break
-                end
-            end
-        end
-
-        BigCode.lineSyntaxStartStates = starts
-        BigCode.lineSyntaxEndStates = ends
-    end
-
-    BigCode.getSource = function()
-        if not BigCode.mode then
-            return editorBox and editorBox.Text or ""
-        end
-        local source = editorBox and editorBox.Text or BigCode.fullText or ""
-        if source ~= BigCode.fullText and BigCode.handleTextChanged then
-            BigCode.handleTextChanged(source)
-        end
-        return source
-    end
-
-    BigCode.harvestVirtualSlots = function()
-        if BigCode.mode and editorBox then
-            BigCode.fullText = editorBox.Text or ""
-            BigCode.chunks = { BigCode.fullText }
-        end
-    end
-
-    BigCode.handleTextChanged = function(source)
-        if not BigCode.mode or BigCode.rebuilding then return end
-        source = tostring(source or "")
-        if source == BigCode.fullText then return end
-
-        local oldLines = BigCode.lines or {}
-        local oldStarts = BigCode.lineSyntaxStartStates or {}
-        local oldEnds = BigCode.lineSyntaxEndStates or {}
-        local newLines = splitSourceLines(source)
-
-        local prefixCount = 0
-        local limit = math.min(#oldLines, #newLines)
-        while prefixCount < limit and oldLines[prefixCount + 1] == newLines[prefixCount + 1] do
-            prefixCount = prefixCount + 1
-        end
-        local oldTail = #oldLines
-        local newTail = #newLines
-        while oldTail > prefixCount and newTail > prefixCount
-            and oldLines[oldTail] == newLines[newTail] do
-            oldTail = oldTail - 1
-            newTail = newTail - 1
-        end
-        local changedMaxWidth = 0
-        for lineIndex = prefixCount + 1, newTail do
-            changedMaxWidth = math.max(changedMaxWidth, measureTextWidth(newLines[lineIndex] or ""))
-        end
-        BigCode.lineMaxWidth = math.max(BigCode.lineMaxWidth or 0, changedMaxWidth)
-
-        BigCode.fullText = source
-        BigCode.chunks = { source }
-        BigCode.chunkStartLines = { 1 }
-        BigCode.lines = newLines
-        BigCode.lineSyntaxStartStates = {}
-        BigCode.lineSyntaxEndStates = {}
-        BigCode.recalculateLineStarts()
-        BigCode.rebuildSyntaxStates(prefixCount + 1, oldLines, oldStarts, oldEnds)
-        BigCode.refreshLayout(true)
-        if EditorSession.updateButtons then EditorSession.updateButtons() end
-    end
-
-    BigCode.createVirtualPool = function()
-        -- This replaces the old pool of chunk TextBoxes. The only editable
-        -- TextBox is editorBox; all pooled per-line objects are non-interactive.
-        for _, slot in ipairs(BigCode.virtualSlots or {}) do
-            if slot and slot ~= editorBox and slot.Parent then slot:Destroy() end
-        end
-        BigCode.virtualSlots = { editorBox }
-        BigCode.slotChunkIndices = { [1] = 1 }
-        BigCode.virtualHighlightSlots = BigCode.virtualHighlightSlots or {}
-        BigCode.virtualGutterSlots = BigCode.virtualGutterSlots or {}
-        BigCode.virtualSelectionSlots = BigCode.virtualSelectionSlots or {}
-        BigCode.linePoolIndices = BigCode.linePoolIndices or {}
-    end
-
-    BigCode.refreshSlotSyntaxHighlight = function(slotIndex)
-        if slotIndex == 1 then
-            BigCode.updateVirtualScroll(true)
-        end
-    end
-
-    BigCode.recalculateMaxWidth = function()
-        local maximumWidth = 0
-        for _, line in ipairs(BigCode.lines or {}) do
-            if line ~= "" then
-                maximumWidth = math.max(maximumWidth, measureTextWidth(line))
-            end
-        end
-        BigCode.lineMaxWidth = maximumWidth
-        if BigCode.mode then BigCode.refreshLayout(true) end
-    end
-
-    BigCode.refreshLayout = function(skipHarvest)
-        if not BigCode.mode or BigCode.rebuilding then return end
-        if not editorViewport or not editorBox then return end
-        local view = editorViewport.AbsoluteSize
-        if view.X <= 0 or view.Y <= 0 then return end
-        if not skipHarvest then BigCode.harvestVirtualSlots() end
-
-        local lines = BigCode.lines or { "" }
-        local sample = TextService:GetTextSize(
-            "Ag", editorBox.TextSize, editorBox.Font, Vector2.new(100000, 100000)
-        )
-        local lineHeight = math.max(editorBox.TextSize + 1, sample.Y * EDITOR_LINE_HEIGHT)
-        BigCode.lineHeight = lineHeight
-
-        if BigCode.lineMaxWidth == nil or BigCode.lineMaxWidth <= 0 then
-            local maximumWidth = 0
-            for _, line in ipairs(lines) do
-                if line ~= "" then
-                    maximumWidth = math.max(maximumWidth, measureTextWidth(line))
-                end
-            end
-            BigCode.lineMaxWidth = maximumWidth
-        end
-        local documentWidth = math.max(view.X - 16, math.ceil(BigCode.lineMaxWidth + 24), 100)
-        local documentHeight = math.max(view.Y - 12, math.ceil(#lines * lineHeight + 12))
-        BigCode.totalLines = #lines
-        BigCode.totalHeight = documentHeight
-        BigCode.chunkOffsets = { 6 }
-        BigCode.chunkHeights = { documentHeight }
-        BigCode.chunkWidths = { documentWidth }
-        BigCode.chunkStartLines = { 1 }
-        BigCode.chunks = { BigCode.fullText or editorBox.Text or "" }
-
-        editorBox.Position = UDim2.fromOffset(8, 6)
-        editorBox.Size = UDim2.fromOffset(documentWidth, documentHeight)
-        editorBox.TextWrapped = false
-        editorBox.LineHeight = EDITOR_LINE_HEIGHT
-        editorBox.Visible = true
-        editorBox.Active = true
-        editorBox.Selectable = true
-        editorBox.TextEditable = true
-        editorBox.TextTransparency = 1
-        editorBox.ZIndex = 3
-        if editorHighlightLabel then editorHighlightLabel.Visible = false end
-        if gutterLabel then
-            gutterLabel.Visible = false
-            gutterLabel.Text = ""
-        end
-        editorViewport.CanvasSize = UDim2.fromOffset(documentWidth + 16, documentHeight + 12)
-        BigCode.updateVirtualScroll(true)
-    end
-
-    BigCode.updateCaretAndSelection = function()
-        if not BigCode.mode or not editorBox or not BigCode.caretFrame then return end
-        local text = editorBox.Text or ""
-        local cursor = editorBox.CursorPosition
-        local selection = editorBox.SelectionStart
-        local hasSelection = cursor and selection and cursor >= 1 and selection >= 1 and cursor ~= selection
-        local low = hasSelection and math.min(cursor, selection) or nil
-        local high = hasSelection and math.max(cursor, selection) or nil
-        local lineHeight = BigCode.lineHeight > 0 and BigCode.lineHeight or 20
-
-        for slotIndex, selectionFrame in ipairs(BigCode.virtualSelectionSlots or {}) do
-            selectionFrame.Visible = false
-            if hasSelection then
-                local lineIndex = BigCode.linePoolIndices[slotIndex]
-                local line = lineIndex and BigCode.lines[lineIndex] or nil
-                local lineStart = lineIndex and BigCode.lineByteStarts[lineIndex] or nil
-                if line and lineStart then
-                    local lineEnd = lineStart + #line
-                    local startPos = math.max(low, lineStart)
-                    local endPos = math.min(high, lineEnd)
-                    local includesNewline = high > lineEnd and lineIndex < BigCode.totalLines
-                    if endPos > startPos or includesNewline then
-                        local prefixBytes = math.max(0, startPos - lineStart)
-                        local selectedBytes = math.max(0, endPos - startPos)
-                        local prefixText = string.sub(line, 1, prefixBytes)
-                        local selectedText = selectedBytes > 0
-                            and string.sub(line, prefixBytes + 1, prefixBytes + selectedBytes) or ""
-                        local x = 8 + measureTextWidth(prefixText)
-                        local width = measureTextWidth(selectedText)
-                        if includesNewline then width = width + 5 end
-                        selectionFrame.Position = UDim2.fromOffset(x, 6 + (lineIndex - 1) * lineHeight)
-                        selectionFrame.Size = UDim2.fromOffset(math.max(2, width), lineHeight)
-                        selectionFrame.Visible = true
-                    end
-                end
-            end
-        end
-
-        BigCode.caretFrame.Visible = false
-        if editorBox:IsFocused() and not hasSelection and cursor and cursor >= 1 then
-            local lowLine, highLine = 1, #BigCode.lines
-            local lineIndex = 1
-            while lowLine <= highLine do
-                local middle = math.floor((lowLine + highLine) / 2)
-                if (BigCode.lineByteStarts[middle] or 1) <= cursor then
-                    lineIndex = middle
-                    lowLine = middle + 1
-                else
-                    highLine = middle - 1
-                end
-            end
-            local line = BigCode.lines[lineIndex] or ""
-            local lineStart = BigCode.lineByteStarts[lineIndex] or 1
-            local localBytes = math.clamp(cursor - lineStart, 0, #line)
-            local prefix = string.sub(line, 1, localBytes)
-            local x = 8 + measureTextWidth(prefix)
-            BigCode.caretFrame.Position = UDim2.fromOffset(x, 6 + (lineIndex - 1) * lineHeight)
-            BigCode.caretFrame.Size = UDim2.fromOffset(1, lineHeight)
-            BigCode.caretFrame.Visible = true
-        end
-    end
-
-    BigCode.updateVirtualScroll = function(forceRefresh)
-        if not BigCode.mode or not editorViewport then return end
-        local lines = BigCode.lines or { "" }
-        local totalLines = math.max(1, #lines)
-        local lineHeight = BigCode.lineHeight > 0 and BigCode.lineHeight or 20
-        local scrollY = editorViewport.CanvasPosition.Y
-        local viewportHeight = editorViewport.AbsoluteSize.Y
-        if viewportHeight <= 0 then return end
-
-        local firstVisible = math.clamp(math.floor(math.max(0, scrollY - 6) / lineHeight) + 1, 1, totalLines)
-        local lastVisible = math.clamp(math.ceil(math.max(0, scrollY + viewportHeight - 6) / lineHeight), firstVisible, totalLines)
-        local firstWanted = math.max(1, firstVisible - 2)
-        local lastWanted = math.min(totalLines, lastVisible + 2)
-        local requiredCount = math.max(1, lastWanted - firstWanted + 1)
-        BigCode.ensureLinePool(requiredCount)
-
-        local activePath = currentProject and currentProject.activeFile or ""
-        local syntaxEnabled = isScriptFile(activePath)
-        local documentWidth = math.max(100, BigCode.lineMaxWidth + 24, editorViewport.AbsoluteSize.X - 16)
-
-        for slotIndex = 1, requiredCount do
-            local lineIndex = firstWanted + slotIndex - 1
-            local line = lines[lineIndex] or ""
-            local rowLabel = BigCode.virtualHighlightSlots[slotIndex]
-            local numberLabel = BigCode.virtualGutterSlots[slotIndex]
-            local selectionFrame = BigCode.virtualSelectionSlots[slotIndex]
-            local oldLineIndex = BigCode.linePoolIndices[slotIndex]
-            local contentY = 6 + (lineIndex - 1) * lineHeight
-
-            rowLabel.Position = UDim2.fromOffset(8, contentY)
-            rowLabel.Size = UDim2.fromOffset(documentWidth, lineHeight)
-            rowLabel.TextSize = editorBox.TextSize
-            rowLabel.LineHeight = EDITOR_LINE_HEIGHT
-            rowLabel.Visible = true
-            rowLabel.Active = false
-            rowLabel.Selectable = false
-            rowLabel.ZIndex = 2
-
-            if forceRefresh or oldLineIndex ~= lineIndex then
-                if syntaxEnabled then
-                    local initialState = BigCode.lineSyntaxStartStates[lineIndex]
-                    rowLabel.RichText = true
-                    rowLabel.Text = SyntaxHighlight.highlightLua(line, initialState)
-                else
-                    rowLabel.RichText = false
-                    rowLabel.Text = line
-                end
-                numberLabel.Text = tostring(lineIndex)
-                numberLabel.Size = UDim2.fromOffset(gutterWidth, lineHeight)
-                BigCode.linePoolIndices[slotIndex] = lineIndex
-            end
-
-            numberLabel.Position = UDim2.fromOffset(0, contentY - scrollY)
-            numberLabel.Visible = true
-            selectionFrame.Visible = false
-        end
-
-        for slotIndex = requiredCount + 1, #BigCode.virtualHighlightSlots do
-            BigCode.virtualHighlightSlots[slotIndex].Visible = false
-            BigCode.virtualGutterSlots[slotIndex].Visible = false
-            BigCode.virtualSelectionSlots[slotIndex].Visible = false
-            BigCode.linePoolIndices[slotIndex] = nil
-        end
-
-        BigCode.virtualSlots = { editorBox }
-        BigCode.slotChunkIndices = { [1] = 1 }
-        BigCode.updateCaretAndSelection()
-    end
-
-    BigCode.render = function(fullText, restoreCanvasPosition, preferredLine)
-        fullText = tostring(fullText or "")
-        local preservePosition = editorBox.Text == fullText
-        local oldCursor = preservePosition and editorBox.CursorPosition or 1
-        local oldSelection = preservePosition and editorBox.SelectionStart or 1
-        local oldCanvas = restoreCanvasPosition or editorViewport.CanvasPosition
-
-        BigCode.rebuilding = true
-        BigCode.mode = true
-        BigCode.selectAll = false
-        BigCode.fullText = fullText
-        if editorBox.Text ~= fullText then
-            editorBox.Text = fullText
-        end
-        BigCode.lines = splitSourceLines(fullText)
-        BigCode.lineByteStarts = {}
-        BigCode.lineSyntaxStartStates = {}
-        BigCode.lineSyntaxEndStates = {}
-        BigCode.lineMaxWidth = 0
-        BigCode.recalculateLineStarts()
-        BigCode.rebuildSyntaxStates(1, {}, {}, {})
-        BigCode.focusedEditor = nil
-        BigCode.focusedChunkIndex = nil
-        BigCode.linePoolIndices = {}
-        BigCode.createVirtualPool()
-
-        editorBox.Visible = true
-        editorBox.Active = true
-        editorBox.Selectable = true
-        editorBox.TextEditable = true
-        editorBox.TextTransparency = 1
-        editorBox.ZIndex = 3
-        if editorHighlightLabel then editorHighlightLabel.Visible = false end
-        if gutterLabel then gutterLabel.Visible = false end
-        BigCode.rebuilding = false
-        BigCode.refreshLayout(true)
-
-        if preferredLine then
-            local targetLine = math.clamp(math.floor(tonumber(preferredLine) or 1), 1, BigCode.totalLines)
-            local targetY = 6 + (targetLine - 1) * BigCode.lineHeight
-            oldCanvas = Vector2.new(oldCanvas.X, math.max(0, targetY - 12))
-        end
-        editorViewport.CanvasPosition = Vector2.new(oldCanvas.X, oldCanvas.Y)
-        BigCode.updateVirtualScroll(true)
-
-        if preservePosition then
-            if oldCursor and oldCursor >= 1 then editorBox.CursorPosition = math.clamp(oldCursor, 1, #fullText + 1) end
-            if oldSelection and oldSelection >= 1 then editorBox.SelectionStart = math.clamp(oldSelection, 1, #fullText + 1) end
-        else
-            editorBox.CursorPosition = 1
-            editorBox.SelectionStart = 1
-        end
-    end
-
-    BigCode.clearMode = function()
-        BigCode.mode = false
-        BigCode.rebuilding = false
-        BigCode.selectAll = false
-        BigCode.fullText = ""
-        BigCode.chunks = {}
-        BigCode.chunkStartLines = {}
-        BigCode.chunkOffsets = {}
-        BigCode.chunkHeights = {}
-        BigCode.chunkWidths = {}
-        BigCode.chunkSyntaxStartStates = {}
-        BigCode.chunkSyntaxEndStates = {}
-        BigCode.lines = {}
-        BigCode.lineByteStarts = {}
-        BigCode.lineSyntaxStartStates = {}
-        BigCode.lineSyntaxEndStates = {}
-        BigCode.linePoolIndices = {}
-        BigCode.totalLines = 1
-        BigCode.totalHeight = 0
-        BigCode.lineHeight = 0
-        BigCode.lineMaxWidth = 0
-        BigCode.focusedEditor = nil
-        BigCode.focusedChunkIndex = nil
-        BigCode.slotChunkIndices = {}
-        BigCode.virtualSlots = {}
-
-        for _, label in ipairs(BigCode.virtualHighlightSlots or {}) do
-            if label and label.Parent then label:Destroy() end
-        end
-        for _, label in ipairs(BigCode.virtualGutterSlots or {}) do
-            if label and label.Parent then label:Destroy() end
-        end
-        for _, frame in ipairs(BigCode.virtualSelectionSlots or {}) do
-            if frame and frame.Parent then frame:Destroy() end
-        end
-        if BigCode.caretFrame and BigCode.caretFrame.Parent then BigCode.caretFrame:Destroy() end
-        BigCode.virtualHighlightSlots = {}
-        BigCode.virtualGutterSlots = {}
-        BigCode.virtualSelectionSlots = {}
-        BigCode.caretFrame = nil
-
-        if editorViewport then
-            for _, child in ipairs(editorViewport:GetChildren()) do
-                if child ~= editorBox and child ~= editorHighlightLabel then
-                    if child.Name:match("^BigCodeVirtual") then child:Destroy() end
-                end
-            end
-            editorViewport.CanvasSize = UDim2.fromOffset(0, 0)
-            editorViewport.CanvasPosition = Vector2.new(0, 0)
-        end
-        for _, child in ipairs(Settings.ProjectNavigation.gutterBg:GetChildren()) do
-            if child ~= gutterLabel and child.Name:match("^BigCodeVirtual") then child:Destroy() end
-        end
-        if gutterLabel then
-            gutterLabel.Visible = true
-            gutterLabel.Text = "1"
-            gutterLabel.Position = UDim2.fromOffset(0, 6)
-            gutterLabel.Size = UDim2.fromOffset(gutterWidth, 220)
-        end
-        if editorBox then
-            editorBox.Visible = true
-            editorBox.Active = true
-            editorBox.Selectable = true
-            editorBox.TextEditable = true
-            editorBox.TextTransparency = 0
-            editorBox.ZIndex = 3
-            editorBox.Position = UDim2.fromOffset(8, 6)
-            editorBox.Size = UDim2.fromOffset(320, 220)
-        end
-        if editorHighlightLabel then
-            editorHighlightLabel.Position = editorBox.Position
-            editorHighlightLabel.Size = editorBox.Size
-        end
-        -- Callers that switch to a normal file will set its text and refresh
-        -- SyntaxHighlight after leaving BigCode. Avoid measuring the previous
-        -- large source here, which would rebuild a full-file normal gutter.
-    end
-
-    BigCode.focusChunkAt = function(lineIndex, cursorPosition)
-        return BigCode.focusLine(lineIndex, cursorPosition)
-    end
-
-    BigCode.focusLine = function(targetLine, cursorPosition)
-        if not BigCode.mode then return false end
-        targetLine = math.clamp(math.floor(tonumber(targetLine) or 1), 1, math.max(1, #BigCode.lines))
-        BigCode.getSource()
-        local targetY = 6 + (targetLine - 1) * BigCode.lineHeight
-        local canvas = editorViewport.CanvasPosition
-        editorViewport.CanvasPosition = Vector2.new(canvas.X, math.max(0, targetY - 12))
-        BigCode.updateVirtualScroll(true)
-        local position = cursorPosition or BigCode.lineByteStarts[targetLine] or 1
-        editorBox:CaptureFocus()
-        editorBox.CursorPosition = math.clamp(position, 1, #(editorBox.Text or "") + 1)
-        editorBox.SelectionStart = editorBox.CursorPosition
-        BigCode.focusedEditor = editorBox
-        BigCode.focusedChunkIndex = nil
-        BigCode.updateCaretAndSelection()
-        return true
-    end
-
-    BigCode.queueRechunk = function()
-        -- Line virtualization has no chunk boundaries to rebuild.
-    end
-end
-
 editorViewport:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
     if BigCode.mode then
         BigCode.updateVirtualScroll()
@@ -3995,12 +2535,13 @@ do
         isSwitchingToBigCode = true
         local ok, err = pcall(function()
             BigCode.render(fullText)
-            editorBox.Visible = true
-            editorBox.Active = true
-            editorBox.Selectable = true
-            editorBox.TextEditable = true
-            if EditorSession.updateButtons then EditorSession.updateButtons() end
-            editorStatus.Text = "Auto-switched to line-virtualized BigCode (" .. tostring(textLength) .. " chars)"
+            editorBox.Text = ""
+            editorBox.Visible = false
+            editorBox.TextEditable = false
+            if currentProject then
+                syncEditorToFile(currentProject, fullText)
+            end
+            editorStatus.Text = "Auto-switched to BigCode (" .. tostring(textLength) .. " chars)"
             editorStatus.TextColor3 = COLORS.Green
             logConsole(
                 "Info",
@@ -4019,28 +2560,25 @@ do
         end
     end
     editorBox:GetPropertyChangedSignal("Text"):Connect(function()
-        if isSwitchingToBigCode or BigCode.rebuilding then return end
+        if isSwitchingToBigCode then return end
         local currentText = editorBox.Text or ""
         local textLength = #currentText
-
         if BigCode.mode then
-            BigCode.handleTextChanged(currentText)
-            if not EditorSession.loading and EditorSession.updateButtons then
-                EditorSession.updateButtons()
+            if editorBox.Visible then
+                editorBox.Visible = false
+                editorBox.TextEditable = false
             end
-            task.defer(keepEditorCaretVisible)
             return
         end
-
-        refreshEditorSyntaxHighlight(currentText)
         if BigCode.shouldUsePreview(currentText) then
             switchToBigCode(currentText, textLength)
-            if EditorSession.updateButtons then EditorSession.updateButtons() end
+            Settings.debouncedAutoSave()
             return
         end
-        if not EditorSession.loading and EditorSession.updateButtons then
-            EditorSession.updateButtons()
+        if currentProject and editorBox.TextEditable then
+            syncEditorToFile(currentProject, currentText)
         end
+        Settings.debouncedAutoSave()
         remeasureEditorAfterTextChange()
         task.defer(keepEditorCaretVisible)
         if textLength >= 28000 and textLength <= 30000 then
@@ -4051,7 +2589,6 @@ do
 end
 pcall(function()
     editorBox:GetPropertyChangedSignal("TextBounds"):Connect(function()
-        if BigCode.mode then return end
         measureEditorCanvas()
     end)
 end)
@@ -4120,7 +2657,7 @@ UserInputService.InputBegan:Connect(function(input)
             end
             local lastLine=string.sub(prefix,lastBreak+1)
             local width=TextService:GetTextSize(lastLine~="" and lastLine or " ",box.TextSize,box.Font,Vector2.new(100000,100000)).X
-            local lineHeight=math.max(box.TextSize+1,TextService:GetTextSize("Ag",box.TextSize,box.Font,Vector2.new(100000,100000)).Y*EDITOR_LINE_HEIGHT)
+            local lineHeight=math.max(box.TextSize+2,TextService:GetTextSize("Ag",box.TextSize,box.Font,Vector2.new(100000,100000)).Y*1.3)
             local canvas=editorViewport.CanvasPosition
             local boxTop=box.AbsolutePosition.Y-editorViewport.AbsolutePosition.Y+canvas.Y
             local x=8+width
@@ -4369,31 +2906,16 @@ renderFileTree=function()
             entry.isFolder and Enum.Font.GothamBold or Enum.Font.Code)
         entryLabel.TextTruncate = Enum.TextTruncate.AtEnd
 
-        local function handleRowActivation(skipNavigationCheck, pathOverride)
-            -- Do not let selecting a different row silently replace an edited Path Bar value.
-            if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-                local selectionBeforeNavigation = selectedTreePath
-                EditorSession.requestNavigation(function()
-                    local resolvedPath = entry.path
-                    if entry.path == selectionBeforeNavigation and selectedTreePath ~= selectionBeforeNavigation then
-                        -- Commit may have renamed the currently selected row while the prompt was open.
-                        resolvedPath = selectedTreePath
-                    end
-                    handleRowActivation(true, resolvedPath)
-                end)
-                return
-            end
-
-            local entryPath = pathOverride or entry.path
+        row.Activated:Connect(function()
             local now = os.clock()
-            local doubleClick = lastTreeClickPath == entryPath
+            local doubleClick = lastTreeClickPath == entry.path
                 and lastTreeClickIsFolder == entry.isFolder
                 and now - lastTreeClickTime <= 0.38
-            lastTreeClickPath = entryPath
+            lastTreeClickPath = entry.path
             lastTreeClickIsFolder = entry.isFolder
             lastTreeClickTime = now
 
-            selectedTreePath = entryPath
+            selectedTreePath = entry.path
             selectedTreeIsFolder = entry.isFolder
             BigCode.updateAutoExecuteMenuButton()
             if updatePathBar then updatePathBar() end
@@ -4401,99 +2923,78 @@ renderFileTree=function()
             if doubleClick then
                 lastTreeClickPath = nil
                 if entry.isFolder then
-                    EditorSession.requestNavigation(function()
-                        Settings.ProjectNavigation.currentViewDir = entryPath
-                        selectedTreePath = ""
-                        selectedTreeIsFolder = true
-                        if updatePathBar then updatePathBar() end
-                        renderFileTree()
-                    end)
+                    Settings.ProjectNavigation.currentViewDir = entry.path
+                    selectedTreePath = ""
+                    selectedTreeIsFolder = true
+                    if updatePathBar then updatePathBar() end
+                    renderFileTree()
                     return
                 end
 
-                -- Opening another file is a navigation action: ask before discarding a draft.
-                EditorSession.requestNavigation(function()
-                    if BigCode.clearMode then BigCode.clearMode() end
-                    EditorSession.loading = true
-                    currentProject.activeFile = entryPath
-                    Settings.ProjectNavigation.viewingFile = true
-                    if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
-                    if toolsPanel then toolsPanel.Visible = false end
-                    refreshEditorFileHeader(entryPath)
-                    local currentFile = getProjectFile(currentProject, entryPath)
-                    local fileSource = currentFile and currentFile.code or entry.file.code or ""
-
-                    if Settings.ProjectNavigation.codePanel then
-                        Settings.ProjectNavigation.codePanel.Visible = true
-                        Settings.ProjectNavigation.codePanel.Position = UDim2.fromOffset(7, 0)
-                        Settings.ProjectNavigation.codePanel.Size = UDim2.new(1, -14, 1, 0)
-                    end
-                    if Settings.ProjectNavigation.treePanel then Settings.ProjectNavigation.treePanel.Visible = false end
-                    if editorViewport then
-                        editorViewport.Visible = true
-                        editorViewport.CanvasPosition = Vector2.new(0,0)
-                    end
-                    if Settings.ProjectNavigation.gutterBg then Settings.ProjectNavigation.gutterBg.Visible = true end
-                    if Settings.ProjectNavigation.newlineButton then Settings.ProjectNavigation.newlineButton.Visible = true end
-                    if Settings.ProjectNavigation.pasteButton then Settings.ProjectNavigation.pasteButton.Visible = true end
-                    if editorFileLabel then editorFileLabel.Visible = true end
-                    if Settings.ProjectNavigation.backButton then
-                        Settings.ProjectNavigation.backButton.Text = "←"
-                        Settings.ProjectNavigation.backButton.Size = UDim2.fromOffset(34, 30)
-                        Settings.ProjectNavigation.backButton.TextSize = 18
-                    end
-                    if Settings.ProjectNavigation.treeToggleButton then
-                        Settings.ProjectNavigation.treeToggleButton.Visible = true
-                        Settings.ProjectNavigation.treeToggleButton.Active = true
-                        Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = true
-                        Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Accent
-                    end
-
-                    if BigCode.shouldUsePreview(fileSource) then
-                        BigCode.render(fileSource)
-                        editorBox.Visible = true
-                        editorBox.Active = true
-                        editorBox.Selectable = true
-                        editorBox.TextEditable = true
-                    else
-                        editorBox.Visible = true
-                        editorBox.Active = true
-                        editorBox.Selectable = true
-                        editorBox.TextEditable = true
-                        editorBox.Text = fileSource
-                        if Settings.refreshEditorSyntaxHighlight then
-                            Settings.refreshEditorSyntaxHighlight(fileSource)
-                        end
-                        task.defer(measureEditorCanvas)
-                    end
-                    EditorSession.setBaseline(entryPath, fileSource)
-                    currentProject.updated = os.time()
+                -- Open the selected file in a full-screen editor view.
+                if currentProject and (BigCode.mode or editorBox.TextEditable) then
+                    BigCode.syncCurrentFile()
                     saveData()
-                    if updatePathBar then updatePathBar() end
-                    editorStatus.Text = "Editing: " .. entryPath
-                    editorStatus.TextColor3 = COLORS.Green
-                end)
+                end
+                if BigCode.clearMode then BigCode.clearMode() end
+                currentProject.activeFile = entry.path
+                Settings.ProjectNavigation.viewingFile = true
+                if Settings.ProjectNavigation.editorMenu then Settings.ProjectNavigation.editorMenu.Visible = false end
+                if toolsPanel then toolsPanel.Visible = false end
+                refreshEditorFileHeader(entry.path)
+                local currentFile = getProjectFile(currentProject, entry.path)
+                local fileSource = currentFile and currentFile.code or entry.file.code or ""
+
+                if Settings.ProjectNavigation.codePanel then
+                    Settings.ProjectNavigation.codePanel.Visible = true
+                    Settings.ProjectNavigation.codePanel.Position = UDim2.fromOffset(7, 0)
+                    Settings.ProjectNavigation.codePanel.Size = UDim2.new(1, -14, 1, 0)
+                end
+                if Settings.ProjectNavigation.treePanel then Settings.ProjectNavigation.treePanel.Visible = false end
+                if editorViewport then
+                    editorViewport.Visible = true
+                    editorViewport.CanvasPosition = Vector2.new(0,0)
+                end
+                if Settings.ProjectNavigation.gutterBg then Settings.ProjectNavigation.gutterBg.Visible = true end
+                if Settings.ProjectNavigation.newlineButton then Settings.ProjectNavigation.newlineButton.Visible = true end
+                if Settings.ProjectNavigation.pasteButton then Settings.ProjectNavigation.pasteButton.Visible = true end
+                if editorFileLabel then editorFileLabel.Visible = true end
+                if Settings.ProjectNavigation.backButton then
+                    Settings.ProjectNavigation.backButton.Text = "←"
+                    Settings.ProjectNavigation.backButton.Size = UDim2.fromOffset(34, 30)
+                    Settings.ProjectNavigation.backButton.TextSize = 18
+                end
+                if Settings.ProjectNavigation.treeToggleButton then
+                    Settings.ProjectNavigation.treeToggleButton.Visible = true
+                    Settings.ProjectNavigation.treeToggleButton.Active = true
+                    Settings.ProjectNavigation.treeToggleButton.AutoButtonColor = true
+                    Settings.ProjectNavigation.treeToggleButton.TextColor3 = COLORS.Accent
+                end
+
+                if BigCode.shouldUsePreview(fileSource) then
+                    BigCode.render(fileSource)
+                else
+                    editorBox.Visible = true
+                    editorBox.TextEditable = true
+                    editorBox.Text = fileSource
+                    task.defer(measureEditorCanvas)
+                end
+                currentProject.updated = os.time()
+                saveData()
+                if updatePathBar then updatePathBar() end
+                editorStatus.Text = "Editing: " .. entry.path
+                editorStatus.TextColor3 = COLORS.Green
                 return
             end
 
             renderFileTree()
-        end
-
-        row.Activated:Connect(function()
-            handleRowActivation(false)
         end)
     end
     BigCode.updateAutoExecuteMenuButton()
 end
 
-Settings.ProjectNavigation.showCreateItemPopup = function(skipNavigationCheck)
+Settings.ProjectNavigation.showCreateItemPopup = function()
     if not currentProject then return end
-    if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function()
-            Settings.ProjectNavigation.showCreateItemPopup(true)
-        end)
-        return
-    end
     local overlay = make("Frame", {
         Name = "InputOverlay",
         Size = UDim2.fromScale(1,1),
@@ -4667,12 +3168,8 @@ local function showConfirmPopup(parent,titleText,message,onConfirm)
     confirm.ZIndex=102
     return overlay
 end
-createNewFile=function(skipNavigationCheck)
+createNewFile=function()
     if not currentProject then return end
-    if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() createNewFile(true) end)
-        return
-    end
     local initial=appendToBase(currentCreationBase(),"new.lua")
     showPathPopup("Add file",initial,"Create",function(value)
         local path=normalizePath(value)
@@ -4680,20 +3177,17 @@ createNewFile=function(skipNavigationCheck)
         if not path:match("%.[%w_%-]+$") then path=path..".lua" end
         if not isSupportedFile(path) then return false,"Supported: .lua/.luau/.json/.txt/.md" end
         if pathTaken(currentProject,path) then return false,"Path exists." end
+        if BigCode.mode or editorBox.TextEditable then
+            BigCode.syncCurrentFile()
+        end
         if BigCode.clearMode then BigCode.clearMode() end
         ensureParentFolders(currentProject,path)
         local newFile={path=path,code="",autoExecute=false}
         table.insert(currentProject.files,newFile)
         currentProject.activeFile=path
-        Settings.ProjectNavigation.viewingFile=true
-        EditorSession.loading=true
-        editorBox.Visible=true
-        editorBox.Active=true
-        editorBox.Selectable=true
         editorBox.TextEditable=true
         editorBox.Text=""
         refreshEditorFileHeader(path)
-        EditorSession.setBaseline(path, "")
         editorViewport.CanvasPosition=Vector2.new(0,0)
         selectedTreePath=path
         selectedTreeIsFolder=false
@@ -4706,17 +3200,14 @@ createNewFile=function(skipNavigationCheck)
         return true
     end)
 end
-createNewFolder=function(skipNavigationCheck)
+createNewFolder=function()
     if not currentProject then return end
-    if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() createNewFolder(true) end)
-        return
-    end
     local initial=appendToBase(currentCreationBase(),"NewFolder")
     showPathPopup("Add folder",initial,"Create",function(value)
         local path=normalizePath(value)
         if not path then return false,"Invalid folder path." end
         if pathTaken(currentProject,path) then return false,"Path exists." end
+        if BigCode.mode or editorBox.TextEditable then BigCode.syncCurrentFile() end
         ensureParentFolders(currentProject,path)
         table.insert(currentProject.folders,path)
         selectedTreePath=path
@@ -4730,18 +3221,15 @@ createNewFolder=function(skipNavigationCheck)
         return true
     end)
 end
-renameSelectedPath=function(requestedPath,skipNavigationCheck,skipSave)
+renameSelectedPath=function(requestedPath)
     if not currentProject then return false,"No project is open." end
     if selectedTreePath=="" then return true end
     local oldPath=selectedTreePath
     local isFolder=selectedTreeIsFolder
-    if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() renameSelectedPath(requestedPath,true,skipSave) end)
-        return false,"Navigation confirmation required."
-    end
     local newPath=normalizePath(requestedPath)
     if not newPath then return false,"Invalid path." end
     if newPath==oldPath then return true end
+    if BigCode.mode or editorBox.TextEditable then BigCode.syncCurrentFile() end
     if isFolder then
         local oldPrefix=oldPath.."/"
         if string.sub(newPath,1,#oldPrefix)==oldPrefix then return false,"Cannot move inside itself." end
@@ -4809,30 +3297,23 @@ renameSelectedPath=function(requestedPath,skipNavigationCheck,skipSave)
     end
     selectedTreePath=newPath
     currentProject.updated=os.time()
-    if not skipSave then saveData() end
-    if EditorSession then EditorSession.committedPath=currentProject.activeFile end
+    saveData()
     renderFileTree()
     if updatePathBar then updatePathBar() end
     if renderProjects then renderProjects() end
     if renderExecutePage then renderExecutePage() end
-    if currentProject.activeFile then
-        refreshEditorFileHeader(currentProject.activeFile)
-        if Settings.refreshEditorSyntaxHighlight and Settings.ProjectNavigation.viewingFile then
-            Settings.refreshEditorSyntaxHighlight(EditorSession.getCurrentSource())
-        end
-    end
+    if currentProject.activeFile then refreshEditorFileHeader(currentProject.activeFile) end
     logConsole("Success","Renamed "..oldPath.." to "..newPath)
     return true
 end
-deleteSelectedTree=function(skipNavigationCheck)
+deleteSelectedTree=function()
     if not currentProject then return false,"No project is open." end
     if not selectedTreePath or selectedTreePath=="" then return false,"Select a file or folder first." end
+    if BigCode.mode or editorBox.TextEditable then
+        BigCode.syncCurrentFile()
+    end
     local target=selectedTreePath
     local deletingFolder=selectedTreeIsFolder
-    if not skipNavigationCheck and EditorSession.hasPendingChanges() then
-        EditorSession.requestNavigation(function() deleteSelectedTree(true) end)
-        return false
-    end
     if not deletingFolder and #currentProject.files<=1 then
         logConsole("Warning","Project needs at least 1 file.")
         return false,"Project needs at least 1 file."
@@ -4876,24 +3357,14 @@ deleteSelectedTree=function(skipNavigationCheck)
     local activeFile=getProjectFile(currentProject,currentProject.activeFile)
     refreshEditorFileHeader(currentProject.activeFile)
     local activeSource=activeFile and activeFile.code or ""
-    EditorSession.loading=true
     if BigCode.shouldUsePreview(activeSource) then
         BigCode.render(activeSource)
-        editorBox.Visible=true
-        editorBox.Active=true
-        editorBox.Selectable=true
-        editorBox.TextEditable=true
     else
-        if BigCode.mode and BigCode.clearMode then BigCode.clearMode() end
         editorBox.Visible=true
-        editorBox.Active=true
-        editorBox.Selectable=true
         editorBox.TextEditable=true
         editorBox.Text=activeSource
-        if Settings.refreshEditorSyntaxHighlight then Settings.refreshEditorSyntaxHighlight(activeSource) end
         task.defer(measureEditorCanvas)
     end
-    EditorSession.setBaseline(currentProject.activeFile, activeSource)
     editorViewport.CanvasPosition=Vector2.new(0,0)
     selectedTreePath=currentProject.activeFile
     selectedTreeIsFolder=false
@@ -4930,8 +3401,9 @@ updatePathBar=function()
     pathBarParts.inputOriginalText=pathBarParts.input.Text
     pathBarParts.updateSize()
     pathBarUpdating=false
+    pathCommitButton.Text="Save"
     pathCommitButton.Visible=true
-    if EditorSession.updateButtons then EditorSession.updateButtons() end
+    pathCancelButton.Visible=false
 end
 Settings.ProjectNavigation.editorMenu=make("Frame",{Name="EditorDropdown",Size=UDim2.fromOffset(compact and 142 or 164,130),
     Position=UDim2.fromOffset(10,82),BackgroundColor3=COLORS.Panel,BorderSizePixel=0,Visible=false,ZIndex=30,Active=true},editorPage)
@@ -5016,8 +3488,8 @@ do
         local linePrefix = string.sub(prefix, lastBreak + 1)
         local textSize = targetBox.TextSize
         local font = targetBox.Font
-        local lineHeight = math.max(textSize + 1,
-            TextService:GetTextSize("Ag", textSize, font, Vector2.new(100000, 100000)).Y * EDITOR_LINE_HEIGHT)
+        local lineHeight = math.max(textSize + 2,
+            TextService:GetTextSize("Ag", textSize, font, Vector2.new(100000, 100000)).Y * 1.3)
         local charWidth = TextService:GetTextSize(
             linePrefix ~= "" and linePrefix or " ", textSize, font, Vector2.new(100000, 100000)
         ).X
@@ -5028,7 +3500,7 @@ do
         findOverlay.Parent = targetBox
         findOverlay.Position = UDim2.fromOffset(charWidth, (lineNum - 1) * lineHeight)
         findOverlay.Size = UDim2.fromOffset(math.max(2, matchWidth), lineHeight)
-        findOverlay.ZIndex = targetBox.ZIndex + 3
+        findOverlay.ZIndex = targetBox.ZIndex + 1
         findOverlay.Visible = true
     end
     local function findVirtualSlot(globalIndex)
@@ -5072,7 +3544,7 @@ do
             local lineMetrics = TextService:GetTextSize(
                 "Ag", editorBox.TextSize, Enum.Font.Code, Vector2.new(100000, 100000)
             )
-            local lineHeight = math.max(editorBox.TextSize + 1, lineMetrics.Y * EDITOR_LINE_HEIGHT)
+            local lineHeight = math.max(editorBox.TextSize + 2, lineMetrics.Y * 1.3)
             local lineWidth = TextService:GetTextSize(
                 linePrefix ~= "" and linePrefix or " ", editorBox.TextSize, Enum.Font.Code,
                 Vector2.new(100000, 100000)
@@ -5112,7 +3584,7 @@ do
         local metrics = TextService:GetTextSize(
             "Ag", editorBox.TextSize, editorBox.Font, Vector2.new(100000, 100000)
         )
-        local lineHeight = math.max(editorBox.TextSize + 1, metrics.Y * EDITOR_LINE_HEIGHT)
+        local lineHeight = math.max(editorBox.TextSize + 2, metrics.Y * 1.3)
         local lineWidth = TextService:GetTextSize(
             linePrefix ~= "" and linePrefix or " ", editorBox.TextSize, editorBox.Font,
             Vector2.new(100000, 100000)
@@ -8815,6 +7287,7 @@ screenGui.Destroying:Connect(function()
         end)
     end
 end)
+if Settings.updateSaveButtonVisibility then Settings.updateSaveButtonVisibility() end
 task.defer(function() Settings.replayLoadHistory() end)
 
 print("Easy Scripting "..VERSION.." loaded.")
