@@ -718,17 +718,36 @@ createButton(mainToolbar,"Settings",UDim2.fromOffset(Settings.settingsButtonWidt
 end,COLORS.Panel2)
 createButton(mainToolbar,"Execute",UDim2.fromOffset(Settings.executeButtonWidth,34),UDim2.fromOffset(Settings.executeButtonX,4),showExecutePage,COLORS.Panel2)
 Settings.page = make("Frame",{Name="SettingsPage",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Visible=false},body)
+local function getQueueOnTeleportCandidates()
+    local candidates = {}
+    local seen = {}
+
+    local function addCandidate(name, callback)
+        if type(callback) == "function" and not seen[callback] then
+            seen[callback] = true
+            table.insert(candidates, {name = name, callback = callback})
+        end
+    end
+
+    -- Prefer the exact Synapse-compatible API style used in the Delta example.
+    if type(syn) == "table" then
+        addCandidate("syn.queue_on_teleport", syn.queue_on_teleport)
+    end
+    addCandidate("queue_on_teleport", queue_on_teleport)
+    addCandidate("queueonteleport", queueonteleport)
+    addCandidate("queue_on_tp", queue_on_tp)
+    if type(fluxus) == "table" then
+        addCandidate("fluxus.queue_on_teleport", fluxus.queue_on_teleport)
+    end
+
+    return candidates
+end
+
 local function getQueueOnTeleportFunction()
-    if type(queue_on_teleport) == "function" then return queue_on_teleport end
-    if type(queueonteleport) == "function" then return queueonteleport end
-    if type(queue_on_tp) == "function" then return queue_on_tp end
-    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
-        return syn.queue_on_teleport
-    end
-    if type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" then
-        return fluxus.queue_on_teleport
-    end
-    return nil
+    local candidates = getQueueOnTeleportCandidates()
+    local first = candidates[1]
+    if first then return first.callback, first.name end
+    return nil, nil
 end
 
 Settings.showSettingsPage = function()
@@ -907,7 +926,9 @@ Settings.showSettingsPage = function()
         Settings.saveSettings()
     end)
 
-    local queueAvailable = getQueueOnTeleportFunction() ~= nil
+    local queueCandidatesForUI = getQueueOnTeleportCandidates()
+    local queueAvailable = #queueCandidatesForUI > 0
+    local queueDisplayName = queueCandidatesForUI[1] and queueCandidatesForUI[1].name or nil
     local teleportToggle = createButton(teleportCard,
         Settings.AppSettings.teleportReloadEnabled and "Teleport Reload: ON" or "Teleport Reload: OFF",
         UDim2.new(1,-20,0,30), UDim2.fromOffset(10,112), function()
@@ -932,6 +953,9 @@ Settings.showSettingsPage = function()
     teleportToggle.TextSize = 10
     if not queueAvailable then
         local queueNote = createLabel(teleportCard, "Executor queue API not detected.", UDim2.new(1,-20,0,10), UDim2.fromOffset(10,143), 8, COLORS.Yellow)
+        queueNote.ZIndex = 54
+    else
+        local queueNote = createLabel(teleportCard, "Queue API: " .. tostring(queueDisplayName), UDim2.new(1,-20,0,10), UDim2.fromOffset(10,143), 8, COLORS.Green)
         queueNote.ZIndex = 54
     end
 
@@ -7400,12 +7424,17 @@ Settings.installTeleportContinuation = function()
 
     local teleportQueuePending = false
     local connected, connection = pcall(function()
-        return LocalPlayer.OnTeleport:Connect(function(teleportState)
+        return LocalPlayer.OnTeleport:Connect(function(teleportState, destinationPlaceId)
             if teleportState == Enum.TeleportState.Failed then
                 teleportQueuePending = false
                 return
             end
-            if teleportState ~= Enum.TeleportState.Started or teleportQueuePending then return end
+
+            -- A server-requested teleport may report RequestedFromServer without
+            -- producing Started in some flows. Queue on either state, only once.
+            local shouldQueue = teleportState == Enum.TeleportState.RequestedFromServer
+                or teleportState == Enum.TeleportState.Started
+            if not shouldQueue or teleportQueuePending then return end
             if Settings.AppSettings.teleportReloadEnabled ~= true then return end
 
             local url = trim(Settings.AppSettings.teleportReloadUrl or "")
@@ -7414,9 +7443,9 @@ Settings.installTeleportContinuation = function()
                 return
             end
 
-            local queueFn = getQueueOnTeleportFunction()
-            if not queueFn then
-                warn("Easy Scripting: executor queue_on_teleport is unavailable; cannot continue after teleport.")
+            local queueCandidates = getQueueOnTeleportCandidates()
+            if #queueCandidates == 0 then
+                warn("Easy Scripting: Delta did not expose syn.queue_on_teleport or a compatible queue function.")
                 return
             end
 
@@ -7426,34 +7455,40 @@ Settings.installTeleportContinuation = function()
                 return
             end
 
+            -- Match the requested Delta/Synapse form:
+            -- syn.queue_on_teleport('loadstring(game:HttpGet("<GitHub Raw URL>", true))()')
+            -- The GameId guard prevents reloading if the destination is another Experience.
             local queuedSource = string.format([[
 if game.GameId == %d then
-    local httpOK, source = pcall(function()
-        return game:HttpGet(%q)
+    local ok, err = pcall(function()
+        loadstring(game:HttpGet(%q, true))()
     end)
-    if not httpOK or type(source) ~= "string" then
-        warn("Easy Scripting: failed to download the script after teleport: " .. tostring(source))
-        return
-    end
-    local compileOK, chunk = pcall(loadstring, source)
-    if not compileOK or type(chunk) ~= "function" then
-        warn("Easy Scripting: failed to compile the script after teleport: " .. tostring(chunk))
-        return
-    end
-    local runOK, runError = pcall(chunk)
-    if not runOK then
-        warn("Easy Scripting: failed to start after teleport: " .. tostring(runError))
+    if not ok then
+        warn("Easy Scripting: reload after teleport failed: " .. tostring(err))
     end
 end
 ]], universeId, url)
 
             teleportQueuePending = true
-            local queueOK, queueError = pcall(queueFn, queuedSource)
-            if not queueOK then
+            local queued = false
+            local queueErrors = {}
+            local usedQueueName = nil
+            for _, candidate in ipairs(queueCandidates) do
+                local queueOK, queueError = pcall(candidate.callback, queuedSource)
+                if queueOK then
+                    queued = true
+                    usedQueueName = candidate.name
+                    break
+                end
+                table.insert(queueErrors, candidate.name .. ": " .. tostring(queueError))
+            end
+
+            if not queued then
                 teleportQueuePending = false
-                warn("Easy Scripting: queue_on_teleport failed: " .. tostring(queueError))
+                warn("Easy Scripting: all queue APIs failed: " .. table.concat(queueErrors, " | "))
             else
-                print("Easy Scripting: reload queued for the next Place in this Experience.")
+                print("Easy Scripting: reload queued with " .. tostring(usedQueueName)
+                    .. " for Place " .. tostring(destinationPlaceId or "unknown") .. " in this Experience.")
             end
         end)
     end)
