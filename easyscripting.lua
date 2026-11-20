@@ -61,7 +61,7 @@ local Settings = {
     },
     },
     SETTINGS_FILE = ROOT_FOLDER .. "/settings.json",
-    AppSettings = { theme="Default", autoSave=false, userName="You", deviceMode="auto" },
+    AppSettings = { theme="Default", autoSave=false, userName="You", deviceMode="auto", teleportReloadEnabled=false, teleportReloadUrl="" },
 }
 Settings.loadSettings = function()
     if type(readfile) ~= "function" then return end
@@ -78,6 +78,10 @@ Settings.loadSettings = function()
         end
         if data.deviceMode == "auto" or data.deviceMode == "phone" or data.deviceMode == "pc" then
             Settings.AppSettings.deviceMode = data.deviceMode
+        end
+        Settings.AppSettings.teleportReloadEnabled = data.teleportReloadEnabled == true
+        if type(data.teleportReloadUrl) == "string" then
+            Settings.AppSettings.teleportReloadUrl = data.teleportReloadUrl
         end
     end
 end
@@ -714,6 +718,19 @@ createButton(mainToolbar,"Settings",UDim2.fromOffset(Settings.settingsButtonWidt
 end,COLORS.Panel2)
 createButton(mainToolbar,"Execute",UDim2.fromOffset(Settings.executeButtonWidth,34),UDim2.fromOffset(Settings.executeButtonX,4),showExecutePage,COLORS.Panel2)
 Settings.page = make("Frame",{Name="SettingsPage",Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Visible=false},body)
+local function getQueueOnTeleportFunction()
+    if type(queue_on_teleport) == "function" then return queue_on_teleport end
+    if type(queueonteleport) == "function" then return queueonteleport end
+    if type(queue_on_tp) == "function" then return queue_on_tp end
+    if type(syn) == "table" and type(syn.queue_on_teleport) == "function" then
+        return syn.queue_on_teleport
+    end
+    if type(fluxus) == "table" and type(fluxus.queue_on_teleport) == "function" then
+        return fluxus.queue_on_teleport
+    end
+    return nil
+end
+
 Settings.showSettingsPage = function()
     projectsPage.Visible=false
     executePage.Visible=false
@@ -858,6 +875,64 @@ Settings.showSettingsPage = function()
                 Settings.showSettingsPage()
             end, isActive and COLORS.Accent or COLORS.Panel2)
         btn.TextSize = 11
+    end
+
+    -- === Continue Across Places Card ===
+    local teleportCard = makeSettingsCard("Continue Across Places", 154)
+    local teleportDesc = createLabel(teleportCard,
+        "Re-load Easy Scripting after a teleport to another Place in the same Experience. Requires executor queue support and a GitHub Raw URL.",
+        UDim2.new(1,-20,0,38), UDim2.fromOffset(10,30), 9, COLORS.Muted)
+    teleportDesc.TextWrapped = true
+    teleportDesc.TextYAlignment = Enum.TextYAlignment.Top
+
+    local teleportUrlBox = make("TextBox", {
+        Size = UDim2.new(1,-20,0,32),
+        Position = UDim2.fromOffset(10,70),
+        BackgroundColor3 = COLORS.Panel2,
+        BorderSizePixel = 0,
+        Text = Settings.AppSettings.teleportReloadUrl or "",
+        PlaceholderText = "https://raw.githubusercontent.com/.../EasyScripting.lua",
+        PlaceholderColor3 = COLORS.Muted,
+        TextColor3 = COLORS.Text,
+        TextSize = 10,
+        Font = Enum.Font.Code,
+        ClearTextOnFocus = false,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 54,
+    }, teleportCard)
+    addCorner(teleportUrlBox, 6)
+    teleportUrlBox.FocusLost:Connect(function()
+        Settings.AppSettings.teleportReloadUrl = trim(teleportUrlBox.Text)
+        teleportUrlBox.Text = Settings.AppSettings.teleportReloadUrl
+        Settings.saveSettings()
+    end)
+
+    local queueAvailable = getQueueOnTeleportFunction() ~= nil
+    local teleportToggle = createButton(teleportCard,
+        Settings.AppSettings.teleportReloadEnabled and "Teleport Reload: ON" or "Teleport Reload: OFF",
+        UDim2.new(1,-20,0,30), UDim2.fromOffset(10,112), function()
+            local url = trim(teleportUrlBox.Text)
+            Settings.AppSettings.teleportReloadUrl = url
+            if not Settings.AppSettings.teleportReloadEnabled then
+                if not url:match("^https://") then
+                    logConsole("Warning", "Teleport Reload: enter a direct HTTPS GitHub Raw URL first.")
+                    return
+                end
+                if not getQueueOnTeleportFunction() then
+                    logConsole("Warning", "Teleport Reload unavailable: this executor does not expose a supported queue_on_teleport function.")
+                    return
+                end
+                Settings.AppSettings.teleportReloadEnabled = true
+            else
+                Settings.AppSettings.teleportReloadEnabled = false
+            end
+            Settings.saveSettings()
+            Settings.showSettingsPage()
+        end, Settings.AppSettings.teleportReloadEnabled and COLORS.Green or COLORS.Panel2)
+    teleportToggle.TextSize = 10
+    if not queueAvailable then
+        local queueNote = createLabel(teleportCard, "Executor queue API not detected.", UDim2.new(1,-20,0,10), UDim2.fromOffset(10,143), 8, COLORS.Yellow)
+        queueNote.ZIndex = 54
     end
 
     -- Back Button (anchored to Settings.page, not the scroll)
@@ -4067,68 +4142,93 @@ Settings.replayStart = function()
     pcall(function()
         if not Replay.hookSupported then return end
         if type(hookmetamethod) ~= "function" or type(getrawmetatable) ~= "function" or type(setreadonly) ~= "function" or type(getnamecallmethod) ~= "function" or type(newcclosure) ~= "function" then return end
+
         local mt = getrawmetatable(game)
         if not mt then return end
+
         local oldNamecall = mt.__namecall
+        if type(oldNamecall) ~= "function" then return end
+
         local wrapped = newcclosure(function(self, ...)
-            local method = getnamecallmethod()
-            if Replay.recording and method == "FireServer" and typeof(self) == "Instance" and self:IsA("RemoteEvent") then
-                if Replay.recordMode == "movement" then
-                    return oldNamecall(self, ...)
-                end
-                if Replay.remoteBlacklist and #Replay.remoteBlacklist > 0 then
-                    for _, name in ipairs(Replay.remoteBlacklist) do
-                        if self.Name:lower() == tostring(name):lower() then
-                            return oldNamecall(self, ...)
+            -- Get the method and preserve every argument, including trailing nil values.
+            local methodOK, method = pcall(getnamecallmethod)
+            local argsList = table.pack(...)
+
+            -- IMPORTANT: let the real game call run FIRST. Replay logging must never
+            -- be able to cancel, replace, or swallow a RemoteEvent call.
+            local results = table.pack(oldNamecall(self, table.unpack(argsList, 1, argsList.n)))
+
+            if methodOK and Replay.recording and method == "FireServer" then
+                -- All recorder work is isolated. Any serialization/path/UI error only
+                -- skips this log entry; the original FireServer above has already run.
+                pcall(function()
+                    if typeof(self) ~= "Instance" or not self:IsA("RemoteEvent") then return end
+                    if Replay.recordMode == "movement" then return end
+
+                    if Replay.remoteBlacklist and #Replay.remoteBlacklist > 0 then
+                        for _, name in ipairs(Replay.remoteBlacklist) do
+                            if self.Name:lower() == tostring(name):lower() then
+                                return
+                            end
                         end
                     end
-                end
-                local now = os.clock()
-                local dt1 = now - Replay.lastEventTime
-                Replay.lastEventTime = now
-                local argsList = {...}
-                local serialized = {}
-                local hasSkipped = false
-                for _, a in ipairs(argsList) do
-                    local valueText = Replay.replaySerializeValue(a)
-                    if valueText:find("SKIPPED") then hasSkipped = true end
-                    table.insert(serialized, valueText)
-                end
-                local path = "game"
-                local cur = self
-                while cur and cur ~= game do
-                    path = cur.Name .. (path == "game" and "" or ("." .. path))
-                    cur = cur.Parent
-                end
-                path = "game." .. path:gsub("^" .. self.Name .. "%.?", "")
-                if cur == game then
-                    local comment = hasSkipped and " --[[ some args skipped ]]" or ""
-                    local line = string.format("do local ok, target = pcall(function() return %s end); if ok and target then pcall(function() target:FireServer(unpack(%s)) end) end end%s",
-                        tostring(path), "{" .. table.concat(serialized, ",") .. "}", comment)
-                    if Replay.recordMode ~= "events" then
-                        local root = Replay.replayGetRoot()
-                        if root then
-                            local rx = math.floor(root.CFrame.Position.X * 10 + 0.5) / 10
-                            local ry = math.floor(root.CFrame.Position.Y * 10 + 0.5) / 10
-                            local rz = math.floor(root.CFrame.Position.Z * 10 + 0.5) / 10
-                            Replay.replayPush(dt1, "walk", "", rx, ry, rz)
-                            local dt2 = 0.03
-                            Replay.lastEventTime = Replay.lastEventTime + dt2
-                            Replay.replayPush(dt2, "remote", line)
+
+                    local now = os.clock()
+                    local dt1 = math.max(0, now - (Replay.lastEventTime or now))
+                    Replay.lastEventTime = now
+
+                    local serialized = {}
+                    local hasSkipped = false
+                    for i = 1, argsList.n do
+                        local valueText = Replay.replaySerializeValue(argsList[i])
+                        if valueText:find("SKIPPED", 1, true) then hasSkipped = true end
+                        table.insert(serialized, valueText)
+                    end
+
+                    local path = "game"
+                    local cur = self
+                    while cur and cur ~= game do
+                        path = cur.Name .. (path == "game" and "" or ("." .. path))
+                        cur = cur.Parent
+                    end
+                    path = "game." .. path:gsub("^" .. self.Name .. "%.?", "")
+
+                    if cur == game then
+                        local comment = hasSkipped and " --[[ some args skipped ]]" or ""
+                        local line = string.format(
+                            "do local ok, target = pcall(function() return %s end); if ok and target then pcall(function() target:FireServer(unpack(%s)) end) end end%s",
+                            tostring(path), "{" .. table.concat(serialized, ",") .. "}", comment
+                        )
+
+                        if Replay.recordMode ~= "events" then
+                            local root = Replay.replayGetRoot()
+                            if root then
+                                local rx = math.floor(root.CFrame.Position.X * 10 + 0.5) / 10
+                                local ry = math.floor(root.CFrame.Position.Y * 10 + 0.5) / 10
+                                local rz = math.floor(root.CFrame.Position.Z * 10 + 0.5) / 10
+                                Replay.replayPush(dt1, "walk", "", rx, ry, rz)
+                                Replay.replayPush(0.03, "remote", line)
+                                Replay.lastEventTime = Replay.lastEventTime + 0.03
+                            else
+                                Replay.replayPush(dt1, "remote", line)
+                            end
                         else
                             Replay.replayPush(dt1, "remote", line)
                         end
-                    else
-                        Replay.replayPush(dt1, "remote", line)
+
+                        Replay.remoteHookCount = Replay.remoteHookCount + 1
                     end
-                    Replay.remoteHookCount = Replay.remoteHookCount + 1
-                end
+                end)
             end
-            return oldNamecall(self, ...)
+
+            -- Keep the exact return values of the original namecall.
+            return table.unpack(results, 1, results.n)
         end)
+
         setreadonly(mt, false)
         mt.__namecall = wrapped
         setreadonly(mt, true)
+
         Replay.hookOriginal = oldNamecall
         Replay.hookMetatable = mt
         Replay.hookInstalled = true
@@ -7288,11 +7388,92 @@ end
 toolDexButton.Activated:Connect(function() toolsPanel.Visible=false; openDex() end)
 toolRemoteButton.Activated:Connect(function() toolsPanel.Visible=false; openRemoteSpy() end)
 toolFreeCamButton.Activated:Connect(function() toolsPanel.Visible=false; openFreeCam() end)
+
+-- Re-run from the configured raw URL only when moving between Places in the same Experience.
+-- This is executor queueing, not Roblox Auto Execute.
+Settings.teleportContinuationConnection = nil
+Settings.installTeleportContinuation = function()
+    if Settings.teleportContinuationConnection then
+        pcall(function() Settings.teleportContinuationConnection:Disconnect() end)
+        Settings.teleportContinuationConnection = nil
+    end
+
+    local teleportQueuePending = false
+    local connected, connection = pcall(function()
+        return LocalPlayer.OnTeleport:Connect(function(teleportState)
+            if teleportState == Enum.TeleportState.Failed then
+                teleportQueuePending = false
+                return
+            end
+            if teleportState ~= Enum.TeleportState.Started or teleportQueuePending then return end
+            if Settings.AppSettings.teleportReloadEnabled ~= true then return end
+
+            local url = trim(Settings.AppSettings.teleportReloadUrl or "")
+            if not url:match("^https://") then
+                warn("Easy Scripting: Teleport Reload is enabled, but its URL is not a valid HTTPS URL.")
+                return
+            end
+
+            local queueFn = getQueueOnTeleportFunction()
+            if not queueFn then
+                warn("Easy Scripting: executor queue_on_teleport is unavailable; cannot continue after teleport.")
+                return
+            end
+
+            local universeId = tonumber(game.GameId) or 0
+            if universeId <= 0 then
+                warn("Easy Scripting: cannot identify the current Experience; teleport reload was not queued.")
+                return
+            end
+
+            local queuedSource = string.format([[
+if game.GameId == %d then
+    local httpOK, source = pcall(function()
+        return game:HttpGet(%q)
+    end)
+    if not httpOK or type(source) ~= "string" then
+        warn("Easy Scripting: failed to download the script after teleport: " .. tostring(source))
+        return
+    end
+    local compileOK, chunk = pcall(loadstring, source)
+    if not compileOK or type(chunk) ~= "function" then
+        warn("Easy Scripting: failed to compile the script after teleport: " .. tostring(chunk))
+        return
+    end
+    local runOK, runError = pcall(chunk)
+    if not runOK then
+        warn("Easy Scripting: failed to start after teleport: " .. tostring(runError))
+    end
+end
+]], universeId, url)
+
+            teleportQueuePending = true
+            local queueOK, queueError = pcall(queueFn, queuedSource)
+            if not queueOK then
+                teleportQueuePending = false
+                warn("Easy Scripting: queue_on_teleport failed: " .. tostring(queueError))
+            else
+                print("Easy Scripting: reload queued for the next Place in this Experience.")
+            end
+        end)
+    end)
+    if connected then
+        Settings.teleportContinuationConnection = connection
+    else
+        warn("Easy Scripting: could not connect to Player.OnTeleport: " .. tostring(connection))
+    end
+end
+Settings.installTeleportContinuation()
+
 loadData(); renderProjects(); renderExecutePage()
 if not fileStorageAvailable then
     logConsole("Warning","readfile/writefile unavailable. Session-only projects.")
 else logConsole("Info","Project storage: "..DATA_FILE) end
 screenGui.Destroying:Connect(function()
+    if Settings.teleportContinuationConnection then
+        pcall(function() Settings.teleportContinuationConnection:Disconnect() end)
+        Settings.teleportContinuationConnection = nil
+    end
     if Settings.Replay.recording then pcall(function() Settings.replayStopAndSave() end) end
     if Settings.Replay.recBar and Settings.Replay.recBar.Parent then pcall(function() Settings.Replay.recBar:Destroy() end) end
     if DexAutoRefresh.Detach then pcall(DexAutoRefresh.Detach) end
